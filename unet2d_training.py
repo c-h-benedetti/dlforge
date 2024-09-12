@@ -1,3 +1,13 @@
+import tifffile
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import shutil
+import re
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
 import tensorflow as tf
 from tensorflow.keras.models import Model, Sequential
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
@@ -9,15 +19,12 @@ from tensorflow.keras.callbacks import ModelCheckpoint, TensorBoard
 from tensorflow.keras.utils import plot_model
 from tensorflow.keras import layers, models
 from tensorflow.keras import backend as K
-import tensorflow_datasets as tfds
+
+import pandas as pd
+from tabulate import tabulate
 
 from tqdm import tqdm
-import tifffile
-import random
-import numpy as np
-import matplotlib.pyplot as plt
-import os
-import shutil
+
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 #                              SETTINGS                                           #
@@ -25,16 +32,44 @@ import shutil
 
 #@markdown # ⭐ 1. SETTINGS
 
-#@markdown ## 📍 a. Data paths
+"""
 
-data_folder           = "/home/benedetti/Desktop/eaudissect/output_folder/"       #@param {type: "string"}
-qc_folder             = None                                                      #@param {type: "string"}
-inputs_name           = "images"                                                  #@param {type: "string"}
-masks_name            = "outlines"                                                   #@param {type: "string"}
-models_path           = "/home/benedetti/Desktop/eaudissect/output_folder/models" #@param {type: "string"}
-working_directory     = "/home/benedetti/Desktop/eaudissect"                      #@param {type: "string"}
-model_name_prefix     = "UNet2D"                                                  #@param {type: "string"}
-name_suffix           = ".tif"                                                    #@param {type: "string"}
+- `data_folder`: Folder in which we can find the images and masks folders.
+- `qc_folder`: Folder in which we can find the quality control images and masks folders.
+- `inputs_name`: Name of the folder containing the input images (name of the folder in `data_folder` and `qc_folder`.).
+- `masks_name`: Name of the folder containing the masks (name of the folder in `data_folder` and `qc_folder`.).
+- `models_path`: Folder in which the models will be saved. They will be saved as "{model_name_prefix}-V{version_number}".
+- `working_directory`: Folder in which the training, validation and testing folders will be created.
+- `model_name_prefix`: Prefix of the model name. Will be part of the folder name in `models_path`.
+- `reset_local_data`: If True, the locally copied training, validation and testing folders will be re-imported.
+
+- `validation_percentage`: Percentage of the data that will be used for validation. This data will be moved to the validation folder.
+- `batch_size`: Number of images per batch.
+- `epochs`: Number of epochs for the training.
+- `unet_depth`: Depth of the UNet model == number of layers in the encoder part (== number of layers in the decoder part).
+- `num_filters_start`: Number of filters in the first layer of the UNet.
+- `dropout_rate`: Dropout rate.
+- `optimizer`: Optimizer used for the training.
+- `learning_rate`: Learning rate of the optimizer.
+
+- `use_data_augmentation`: If True, data augmentation will be used.
+- `use_mirroring`: If True, random mirroring will be used.
+- `use_gaussian_noise`: If True, random gaussian noise will be used.
+- `rotation_90`: If True, random rotation of 90, 180 or 270 degrees will be used.
+- `use_gamma_correction`: If True, random gamma correction will be used.
+- `gamma_range`: Range of the gamma correction. The gamma will be in [1 - gamma_range, 1 + gamma_range] (1.0 == neutral).
+
+"""
+
+#@markdown ## 📍 a. Data paths
+data_folder       = "/home/benedetti/Desktop/eaudissect/output_folder/"       #@param {type: "string"}
+qc_folder         = None                                                      #@param {type: "string"}
+inputs_name       = "images"                                                  #@param {type: "string"}
+masks_name        = "outlines"                                                #@param {type: "string"}
+models_path       = "/home/benedetti/Desktop/eaudissect/output_folder/models" #@param {type: "string"}
+working_directory = "/home/benedetti/Desktop/eaudissect/local/"               #@param {type: "string"}
+model_name_prefix = "UNet2D"                                                  #@param {type: "string"}
+reset_local_data  = True                                                      #@param {type: "boolean"}
 
 #@markdown ## 📍 b. Network architecture
 
@@ -50,7 +85,6 @@ learning_rate         = 0.001  #@param {type: "number"}
 #@markdown ## 📍 c. Data augmentation
 
 use_data_augmentation = True  #@param {type: "boolean"}
-augmentation_factor   = 2     #@param {type: "slider", min: 2, max: 6}
 use_mirroring         = True  #@param {type: "boolean"}
 use_gaussian_noise    = True  #@param {type: "boolean"}
 rotation_90           = True  #@param {type: "boolean"}
@@ -65,66 +99,107 @@ gamma_range           = 0.6   #@param {type: "slider", min:0.1, max:1.0}
 
 #@markdown # ⭐ 2. SANITY CHECK
 
+"""
+The goal of this section is to make sure that the data located in the `data_folder` is consistent.
+The following checks will be performed:
+    - All files must be TIFF images ('.tif' or '.tiff', whatever the case).
+    - Each file must be present in all the folders (images and masks).
+    - The shape (X, Y and Z dimensions in pixels) of the images must be the same.
+    - All the data must be useful, it implies that:
+        | Input images have more than 1e-6 between the maximum and minimum values.
+        | Masks must be binary masks (on 8-bits with only 0 and another value).
+"""
+
 #@markdown ## 📍 a. Data check
 
-def is_folder_clean(root_folder):
+# Regex matching a TIFF file, whatever the case and the number of 'f'.
+_TIFF_REGEX = r".+\.tiff?"
+
+def get_data_sets(root_folder, folders, tif_only=False):
     """
-    The folders should only contain the training data, nothing else.
+    Aims to return the files available for training in every folder (not path).
+    Probes the content of the data folders provided by the user.
+    Both the images and the masks are probed.
+    It is possible to filter the files to keep only the tiff files, whatever the case (Hi Windows users o/).
+    In the returned tuple, the first element is a list (not a dict) following the same order as the 'folders' list.
+
+    Args:
+        root_folder (str): The root folder containing the images and masks folders.
+        folders (list): The list of folders to probe.
+        tif_only (bool): If True, only the tiff files will be kept.
+    
+    Returns:
+        tuple: (pool of files per individual folder, the set of all the files found everywhere merged together.)
+    """
+    pools = [] # Pools of files found in the folders.
+    all_data = set() # All the names of files found gathered together.
+    for f in folders: # Fetching content from folders
+        path = os.path.join(root_folder, f)
+        pool = set([i for i in os.listdir(path)])
+        if tif_only:
+            pool = set([i for i in pool if re.match(_TIFF_REGEX, i, re.IGNORECASE)])
+        pools.append(pool)
+        all_data = all_data.union(pool)
+    return pools, all_data
+
+def get_shape():
+    """
+    Searches for the first image in the images folder to determine the input shape of the model.
+
+    Returns:
+        tuple: The shape of the input image.
+    """
+    _, l_files = get_data_sets(data_folder, [inputs_name], True)
+    input_path = os.path.join(data_folder, inputs_name, list(l_files)[0])
+    raw = tifffile.imread(input_path)
+    s = raw.shape
+    if len(s) == 2:
+        s = (s[0], s[1], 1)
+    return s
+
+def is_extension_correct(root_folder, folders):
+    """
+    Checks that the files are all TIFF images.
 
     Args:
         root_folder (str): The root folder containing the images and masks folders
+        folders (list): The list of folders to probe (these folders must be in `root_folder`).
 
     Returns:
-        bool: True if the folders are clean, False otherwise.
+        dict: Keys are files, values are booleans. True if the file is a TIFF image, False otherwise.
     """
-    images_path = os.path.join(root_folder, inputs_name)
-    masks_path = os.path.join(root_folder, masks_name)
-    imgs_list = set([f for f in os.listdir(images_path)])
-    masks_list = set([f for f in os.listdir(masks_path)])
-    imgs_set = set([i for i in imgs_list if i.endswith(name_suffix)])
-    masks_set = set([i for i in masks_list if i.endswith(name_suffix)])
-    if len(imgs_list) != len(imgs_set):
-        print(f"❗ Images folder contains wrong data: {imgs_list.difference(imgs_set)}")
-        return False
-    if len(masks_list) != len(masks_set):
-        print(f"❗ Masks folder contains wrong data: {masks_list.difference(masks_set)}")
-        return False
-    return True
+    _, all_data = get_data_sets(root_folder, folders)
+    _, all_tiff = get_data_sets(root_folder, folders, True)
+    extensions = {k: (k in all_tiff) for k in all_data}
+    return extensions
 
-def is_data_size_identical(root_folder):
+def is_data_shape_identical(root_folder, folders):
     """
-    All images must be the same size.
-    The mask must be the same size as the input.
+    All the data must be the same shape in X, Y and Z.
 
     Args:
-        root_folder (str): The root folder containing the images and masks folders
+        root_folder (str): The root folder containing the images and masks folders.
+        folders (str): The list of folders to probe (these folders must be in `root_folder`).
 
     Returns:
-        bool: True if the data is consistent, False otherwise.
+        dict: Keys are files, values are booleans. True if the shape is identical, False otherwise.
     """
-    images_path = os.path.join(root_folder, inputs_name)
-    masks_path = os.path.join(root_folder, masks_name)
-    imgs_list = [f for f in os.listdir(images_path) if f.endswith(name_suffix)]
-    masks = [f for f in os.listdir(masks_path) if f.endswith(name_suffix)]
+    _, all_data = get_data_sets(root_folder, folders, True)
     ref_size = None
-    src_name = None
-    for img, mask in zip(imgs_list, masks):
-        img_path = os.path.join(images_path, img)
-        mask_path = os.path.join(masks_path, mask)
-        img_data = tifffile.imread(img_path)
-        mask_data = tifffile.imread(mask_path)
-        if ref_size is None:
-            ref_size = img_data.shape
-            src_name = img
-        if img_data.shape != ref_size:
-            print(f"❗ All images don't have the same size: {img_data.shape} in {img} VS {ref_size} in {src_name}.")
-            return False
-        if mask_data.shape != img_data.shape:
-            print(f"❗ A mask has a different size than its associated input: {img_data.shape} VS {mask_data.shape}.")
-            return False
-    return True
+    shapes = {k: False for k in all_data}
+    for file in all_data:
+        for folder in folders:
+            path = os.path.join(root_folder, folder, file)
+            if not os.path.isfile(path):
+                continue
+            img_data = tifffile.imread(path)
+            if ref_size is None:
+                ref_size = img_data.shape
+            if img_data.shape == ref_size:
+                shapes[file] = True
+    return shapes
 
-def is_all_data_useful(root_folder):
+def is_data_useful(root_folder, folders):
     """
     There must not be empty masks or empty images.
 
@@ -136,68 +211,194 @@ def is_all_data_useful(root_folder):
     """
     images_path = os.path.join(root_folder, inputs_name)
     masks_path = os.path.join(root_folder, masks_name)
-    imgs_list = [f for f in os.listdir(images_path) if f.endswith(name_suffix)]
-    masks = [f for f in os.listdir(masks_path) if f.endswith(name_suffix)]
-    for img, mask in zip(imgs_list, masks):
-        img_path = os.path.join(images_path, img)
-        mask_path = os.path.join(masks_path, mask)
+    _, all_data = get_data_sets(root_folder, folders, True)
+    useful_data = {k: False for k in all_data}
+
+    for file in all_data:
+        img_path = os.path.join(images_path, file)
+        mask_path = os.path.join(masks_path, file)
+        if not os.path.isfile(img_path) or not os.path.isfile(mask_path):
+            continue
         img_data = tifffile.imread(img_path)
         mask_data = tifffile.imread(mask_path)
-        if len(np.unique(img_data)) == 1:
-            print(f"❗ Image {img} is empty.")
-            return False
-        if len(np.unique(mask_data)) == 1:
-            print(f"❗ Mask {mask} is empty.")
-            return False
-    return True
+        s = True
+        if np.max(img_data) - np.min(img_data) < 1e-6:
+            s = False
+        if len(np.unique(mask_data)) != 2: # Binary mask
+            s = False
+        useful_data[file] = s
+    return useful_data
 
-def is_content_identical(root_folder):
+def is_matching_data(root_folder, folders):
     """
-    There must be the same number of images in both folders.
-    There must be at least 15 images to start a training.
+    Every file must be present in every folder.
+    Lists every possible file and verifies that it's present everywhere.
 
     Args:
         root_folder (str): The root folder containing the images and masks folders
+        folders (list): The list of folders to probe (these folders must be in `root_folder`).
 
     Returns:
-        bool: True if the data is consistent, False otherwise.
+        dict: Keys are files, values are booleans. True if the file is present everywhere, False otherwise.
     """
-    images_path = os.path.join(root_folder, inputs_name)
-    masks_path  = os.path.join(root_folder, masks_name)
-    imgs_list   = set([f for f in os.listdir(images_path) if f.endswith(name_suffix)])
-    masks_list  = set([f for f in os.listdir(masks_path) if f.endswith(name_suffix)])
-    itr         = imgs_list.intersection(masks_list)
-    if (len(itr) != len(masks_list)) or (len(itr) != len(imgs_list)):
-        print(f"❗ The content of the images and masks folders is not identical: {imgs_list.difference(masks_list)}")
-        return False
-    if len(itr) < 15:
-        print("❗ Not enough images to start a training")
-        return False
-    return True
+    pools, all_data = get_data_sets(root_folder, folders)
+    matching_data   = {k: False for k in all_data}
+    for data in all_data:
+        status = [False for _ in range(len(folders))]
+        for i, pool in enumerate(pools):
+            if data in pool:
+                status[i] = True
+        matching_data[data] = all(status)
+    return matching_data
 
-#@markdown ## 📍 b. Checking runner
+def merge_dicts(d1, d2):
+    """
+    Transfers the values of d2 to d1 if and only if the key doesn't exist in d1.
+    Keys present in d1 are not edited with the value they have in d2.
+    """
+    for key, value in d2.items():
+        if key not in d1:
+            d1[key] = value
 
-# List of sanity checks to perform before starting the training.
+
+#@markdown ## 📍 b. Sanity check launcher
+
 _SANITY_CHECK = [
-    is_data_size_identical,
-    is_all_data_useful,
-    is_content_identical,
-    is_folder_clean
+    ("extension", is_extension_correct),
+    ("pair"     , is_matching_data),
+    ("useful"   , is_data_useful),
+    ("shape"    , is_data_shape_identical)
 ]
 
+_RESET      = "\033[0m"
+_GREEN      = "\033[32m"
+_RED_BOLD   = "\033[1;31m"
+_INSANITIES = {
+    "extension": (f"{_GREEN}OK{_RESET}", f"{_RED_BOLD}UNKNOWN{_RESET}"),
+    "pair"     : (f"{_GREEN}OK{_RESET}", f"{_RED_BOLD}MISSING{_RESET}"),
+    "useful"   : (f"{_GREEN}OK{_RESET}", f"{_RED_BOLD}USELESS{_RESET}"),
+    "shape"    : (f"{_GREEN}OK{_RESET}", f"{_RED_BOLD}MISMATCH{_RESET}")
+}
+
+def apply_verbose(results):
+    verbose = results.copy()
+    for test, pool in results.items():
+        for file, status in pool.items():
+            if not status:
+                verbose[test][file] = _INSANITIES[test][1]
+            else:
+                verbose[test][file] = _INSANITIES[test][0]
+    return verbose
+
 def sanity_check(root_folder):
-    for check in _SANITY_CHECK:
-        if not check(root_folder):
-            raise ValueError(f"💩 You should take a second look at your data... ({root_folder})")
-    print("🎉 The data looks alright!")
-    return True
+    folders = [inputs_name, masks_name]
+    results = {}
+    _, all_data = get_data_sets(root_folder, folders)
+    false_data = {k: False for k in all_data}
+    for name, func in _SANITY_CHECK:
+        results[name] = func(root_folder, folders)
+        merge_dicts(results[name], false_data)
+    assessment = [all(v.values()) for v in results.values()]
+    verbose = apply_verbose(results)
+    df = pd.DataFrame(verbose)
+    df = df.sort_index()
+    print(tabulate(df, headers='keys', tablefmt='fancy_grid'))
+    return all(assessment)
 
-#@markdown ## 📍 c. Running sanity check
 
-sanity_check(data_folder)
-if qc_folder is not None:
-    sanity_check(qc_folder)
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+#                            DATA MIGRATION                                       #
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
+#@markdown # ⭐ 3. DATA MIGRATION
+
+#@markdown ## 📍 a. Utils
+
+_LOCAL_FOLDERS = ["training", "validation", "testing"]
+
+def create_local_dirs(reset=False):
+    """
+    This function is useless if you don't run the code on Google Colab, or any other cloud service.
+    Basically, data access is way faster if you copy the data to the local disk rather than a distant server.
+    Since the data is accessed multiple times during the training, the choice was made to migrate the data to the local disk.
+    There is a possibility to reset the data, in case you want to shuffle your data for the next training.
+
+    Args:
+        reset (bool): If True, the folders will be reset.
+    """
+    if not os.path.isdir(working_directory):
+        raise ValueError(f"Working directory '{working_directory}' does not exist.")
+    leaves = [inputs_name, masks_name]
+    for r in _LOCAL_FOLDERS:
+        for l in leaves:
+            path = os.path.join(working_directory, r, l)
+            if os.path.isdir(path) and reset:
+                shutil.rmtree(path)
+            os.makedirs(path, exist_ok=True)
+
+def copy_to(src_folder, dst_folder, files):
+    """
+    Copies a list of files from a source folder to a destination folder.
+
+    Args:
+        src_folder (str): The source folder.
+        dst_folder (str): The destination folder.
+        files (list): The list of files to copy.
+    """
+    for f in files:
+        src_path = os.path.join(src_folder, f)
+        dst_path = os.path.join(dst_folder, f)
+        shutil.copy(src_path, dst_path)
+
+def check_sum(targets):
+    """
+    Since we move some fractions of data to some other folders, we need to check that the sum of the ratios is equal to 1.
+    Otherwise, we would have some data missing or we would try to read data that doesn't exist.
+    """
+    acc = sum([i[1] for i in targets])
+    return abs(acc - 1.0) < 1e-6
+
+def migrate_data(targets, source):
+    """
+    Copies the content of the source folder to the working directory.
+    The percentage of the data to move is defined in the targets list.
+    Meant to work with pairs of files.
+
+    Args:
+        targets (list): List of tuples. The first element is the name of the folder, the second is the ratio of the data to move.
+        source (str): The source folder
+    """
+    if not check_sum(targets):
+        raise ValueError("The sum of the ratios must be equal to 1.")
+    folders = [inputs_name, masks_name]
+    _, all_data = get_data_sets(source, folders, True)
+    all_data = list(all_data)
+    random.shuffle(all_data)
+    last = 0
+    for target, ratio in targets:
+        n = int(len(all_data) * ratio)
+        copy_to(os.path.join(source, inputs_name), os.path.join(working_directory, target, inputs_name), all_data[last:last+n])
+        copy_to(os.path.join(source, masks_name), os.path.join(working_directory, target, masks_name), all_data[last:last+n])
+        last += n
+
+
+#@markdown ## 📍 b. Datasets generator
+
+def load_dataset(from_folder):
+    images = []
+    masks = []
+    content = sorted([f for f in os.listdir(os.path.join(root_folder, inputs_name)) if f.endswith('.tif')])
+    for c in content:
+        img = tifffile.imread(os.path.join(root_folder, inputs_name, c))
+        mask = tifffile.imread(os.path.join(root_folder, masks_name, c))
+        images.append(img)
+        masks.append(mask)
+    images = tf.constant(np.expand_dims(np.array(images), axis=-1))
+    masks = tf.constant(np.expand_dims(np.array(masks), axis=-1))
+    print(images.shape, masks.shape)
+    ds = tf.data.Dataset.from_tensor_slices((images, masks))
+    ds = ds.batch(batch_size).shuffle(buffer_size=100).prefetch(buffer_size=tf.data.AUTOTUNE)
+    return ds
 
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
@@ -206,30 +407,7 @@ if qc_folder is not None:
 
 #@markdown # ⭐ 3. DATA AUGMENTATION
 
-#@markdown ## 📍 a. Utils
-
-def probe_input_shape():
-    """
-    Searches for the first image in the images folder to determine the input shape of the model.
-
-    Returns:
-        tuple: The shape of the input image.
-    """
-    images_path = os.path.join(data_folder, inputs_name)
-    input_shape = None
-    content = [f for f in os.listdir(images_path) if f.endswith(name_suffix)]
-    if len(content) == 0:
-        return None
-    img = tifffile.imread(os.path.join(images_path, content[0]))
-    if len(img.shape) == 2:
-        input_shape = img.shape + (1,)
-    elif len(img.shape) == 3:
-        input_shape = img.shape
-    else:
-        raise ValueError(f"Unsupported image shape: {img.shape}")
-    return input_shape
-
-#@markdown ## 📍 b. Data augmentation functions
+#@markdown ## 📍 a. Data augmentation functions
 
 def rotation_90_step(image):
     """
@@ -273,7 +451,7 @@ def normalize(image):
     M = np.max(image)
     return (image - m) / (M - m)
 
-#@markdown ## 📍 c. Data augmentation layer
+#@markdown ## 📍 b. Data augmentation layer
 
 def generate_data_augment_layer():
     """
@@ -287,7 +465,7 @@ def generate_data_augment_layer():
         tf.keras.Sequential: The data augmentation layer.
     """
     pipeline = []
-    input_shape = probe_input_shape()
+    input_shape = get_shape()
     if use_data_augmentation:
         if use_mirroring:
             pipeline.append(RandomFlip(mode='horizontal_and_vertical'))
@@ -318,17 +496,12 @@ def visualize_augmentations(images_path, augmentation_layer, num_examples=5):
     temp_model = Model(inputs, outputs)
     
     # Generate augmented images
-    _, axes = plt.subplots(1, num_examples, figsize=(20, 20))
+    fig, axes = plt.subplots(1, num_examples, figsize=(20, 20))
     for i in range(num_examples):
         augmented_image = temp_model(image, training=True)  # training=True to apply augmentation
         axes[i].imshow(tf.squeeze(augmented_image).numpy())
         axes[i].axis('off')
     plt.show()
-
-#@markdown ## 📍 d. Preview augmented data
-
-images_path = os.path.join(data_folder, inputs_name)
-visualize_augmentations(images_path, generate_data_augment_layer(), 10)
 
 
 
@@ -456,7 +629,7 @@ def tversky_loss(alpha=0.5, beta=0.5):
 #@markdown ## 📍 d. Model instanciator
 
 def instanciate_model():
-    input_shape = probe_input_shape()
+    input_shape = get_shape()
     model = create_unet2d_model(input_shape)
     model.compile(
         optimizer=optimizer, 
@@ -472,103 +645,6 @@ def instanciate_model():
         ]
     )
     return model
-
-#@markdown ## 📍 e. Instanciate the model
-
-model = instanciate_model()
-model.summary()
-
-
-
-# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
-#                            DATA MIGRATION                                       #
-# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
-
-#@markdown # ⭐ 4. DATA MIGRATION
-
-#@markdown ## 📍 a. Utils
-
-_LOCAL_FOLDERS = ["training", "validation", "testing"]
-
-def create_local_dirs():
-    if not os.path.isdir(working_directory):
-        raise ValueError(f"Working directory '{working_directory}' does not exist.")
-    leaves = [inputs_name, masks_name]
-    for r in _LOCAL_FOLDERS:
-        for l in leaves:
-            path = os.path.join(working_directory, r, l)
-            if os.path.isdir(path):
-                shutil.rmtree(path)
-            os.makedirs(path)
-
-def copy_to(src_folder, dst_folder, files):
-    for f in files:
-        src_path = os.path.join(src_folder, f)
-        dst_path = os.path.join(dst_folder, f)
-        shutil.copy(src_path, dst_path)
-
-def migrate_data():
-    images_path = os.path.join(data_folder, inputs_name)
-    masks_path = os.path.join(data_folder, masks_name)
-    qc_input_path = None if qc_folder is None else os.path.join(qc_folder, inputs_name)
-    qc_masks_path = None if qc_folder is None else os.path.join(qc_folder, masks_name)
-    # Creating a validation set.
-    content = [f for f in os.listdir(images_path) if f.endswith(name_suffix)]
-    random.shuffle(content)
-    last_idx = int(validation_percentage * len(content))
-
-    copy_to(images_path, os.path.join(working_directory, "validation", inputs_name), content[:last_idx])
-    copy_to(masks_path, os.path.join(working_directory, "validation", masks_name), content[:last_idx])
-    copy_to(images_path, os.path.join(working_directory, "training", inputs_name), content[last_idx:])
-    copy_to(masks_path, os.path.join(working_directory, "training", masks_name), content[last_idx:])
-
-    if (qc_input_path is not None) and (qc_masks_path is not None):
-        qc_content = [f for f in os.listdir(qc_input_path) if f.endswith(name_suffix)]
-        copy_to(qc_input_path, os.path.join(working_directory, "testing", inputs_name), qc_content)
-        copy_to(qc_masks_path, os.path.join(working_directory, "testing", masks_name), qc_content)
-
-def get_local_paths(source):
-    img_dst_val  = os.path.join(working_directory, source, inputs_name)
-    mask_dst_val = os.path.join(working_directory, source, masks_name)
-    return {
-        'images': [os.path.join(img_dst_val, f) for f in os.listdir(img_dst_val)],
-        'masks' : [os.path.join(mask_dst_val, f) for f in os.listdir(mask_dst_val)]
-    }
-
-#@markdown ## 📍 b. Datasets generator
-
-def load_dataset(root_folder):
-    images = []
-    masks = []
-    content = sorted([f for f in os.listdir(os.path.join(root_folder, inputs_name)) if f.endswith('.tif')])
-    for c in content:
-        img = tifffile.imread(os.path.join(root_folder, inputs_name, c))
-        mask = tifffile.imread(os.path.join(root_folder, masks_name, c))
-        img = np.expand_dims(img, axis=-1) 
-        mask = np.expand_dims(mask, axis=-1)
-        images.append(img)
-        masks.append(mask)
-    images = np.array(images)
-    masks = np.array(masks)
-    ds = tf.data.Dataset.from_tensor_slices((images, masks))
-    ds = ds.batch(batch_size).shuffle(buffer_size=100).prefetch(buffer_size=tf.data.AUTOTUNE)
-    return ds
-
-
-#@markdown ## 📍 c. Migration and dataset creation
-
-create_local_dirs()
-migrate_data()
-
-training_dataset   = load_dataset(os.path.join(working_directory, "training"))
-validation_dataset = load_dataset(os.path.join(working_directory, "validation"))
-testing_dataset    = None
-
-if qc_folder is not None:
-    testing_dataset = load_dataset(os.path.join(working_directory, "testing"))
-else:
-    print("😱 No quality control will be performed.")
-
 
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
@@ -588,7 +664,7 @@ def train_model(model, train_dataset, val_dataset):
 
     print(f"💾 Exporting model to: {output_path}")
 
-    checkpoint = ModelCheckpoint('best.keras', save_best_only=True, monitor='val_loss', mode='min')
+    checkpoint = ModelCheckpoint(os.path.join(output_path, 'best.keras'), save_best_only=True, monitor='val_loss', mode='min')
     early_stopping = EarlyStopping(monitor='val_loss', patience=10, mode='min')
     reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=5, min_lr=1e-6, mode='min')
 
@@ -596,13 +672,59 @@ def train_model(model, train_dataset, val_dataset):
         train_dataset,
         validation_data=val_dataset,
         epochs=epochs,
-        steps_per_epoch=100,
+        # steps_per_epoch=100,
         callbacks=[checkpoint, early_stopping, reduce_lr]
     )
 
     model.save(os.path.join(output_path, 'last.keras'))
     return history
 
-#@markdown ## 📍 b. Training the model
 
-history = train_model(model, training_dataset, validation_dataset)
+def main():
+    # 1. Running the sanity checks
+    data_sanity = sanity_check(data_folder)
+    qc_sanity = True
+    if qc_folder is not None:
+        qc_sanity = sanity_check(qc_folder)
+    if not data_sanity or not qc_sanity:
+        print(f"ABORT. 😱 Your {'data' if not data_sanity else 'QC data'} is not consistent. Use the content of the sanity check table above to fix all that and try again.")
+        return
+    
+    # 2. Migrate the data locally
+    create_local_dirs(reset_local_data)
+    migrate_data([
+        ("training", 1.0-validation_percentage),
+        ("validation", validation_percentage)
+        ], data_folder)
+    if qc_folder is not None:
+        migrate_data([
+            ("testing", 1.0)
+            ], qc_folder)
+    
+    return
+    # 2. Preview the effects of data augmentation
+    images_path = os.path.join(data_folder, inputs_name)
+    visualize_augmentations(images_path, generate_data_augment_layer(), 10)
+
+    # 3. Creating the model
+    model = instanciate_model()
+    model.summary()
+
+    # 4. Migrating the data
+    create_local_dirs()
+    migrate_data()
+
+    training_dataset   = load_dataset(os.path.join(working_directory, "training"))
+    validation_dataset = load_dataset(os.path.join(working_directory, "validation"))
+    testing_dataset    = None
+
+    if qc_folder is not None:
+        testing_dataset = load_dataset(os.path.join(working_directory, "testing"))
+    else:
+        print("😱 No quality control will be performed.")
+
+    # 5. Training the model
+    history = train_model(model, training_dataset, validation_dataset)
+
+if __name__ == "__main__":
+    main()
