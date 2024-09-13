@@ -11,7 +11,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import tensorflow as tf
 from tensorflow.keras.models import Model, Sequential
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
-from tensorflow.keras.layers import (Input, Conv2D, MaxPooling2D, 
+from tensorflow.keras.layers import (Input, Conv2D, MaxPooling2D, RandomRotation,
                                      UpSampling2D, concatenate, Dropout,
                                      RandomFlip, GaussianNoise, Lambda)
 from tensorflow.keras.optimizers import Adam
@@ -55,7 +55,7 @@ from tqdm import tqdm
 - `use_data_augmentation`: If True, data augmentation will be used.
 - `use_mirroring`: If True, random mirroring will be used.
 - `use_gaussian_noise`: If True, random gaussian noise will be used.
-- `rotation_90`: If True, random rotation of 90, 180 or 270 degrees will be used.
+- `use_random_rotations`: If True, random rotation of 90, 180 or 270 degrees will be used.
 - `use_gamma_correction`: If True, random gamma correction will be used.
 - `gamma_range`: Range of the gamma correction. The gamma will be in [1 - gamma_range, 1 + gamma_range] (1.0 == neutral).
 
@@ -87,10 +87,11 @@ learning_rate         = 0.001  #@param {type: "number"}
 use_data_augmentation = True  #@param {type: "boolean"}
 use_mirroring         = True  #@param {type: "boolean"}
 use_gaussian_noise    = True  #@param {type: "boolean"}
-rotation_90           = True  #@param {type: "boolean"}
+use_random_rotations  = True  #@param {type: "boolean"}
+rotation_range_2_pi   = 100   #@param {type: "slider", min: 1, max: 100, step: 1}
 use_gamma_correction  = True  #@param {type: "boolean"}
 gamma_range           = 0.6   #@param {type: "slider", min:0.1, max:1.0}
-
+show_preview          = False #@param {type: "boolean"}
 
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
@@ -384,21 +385,58 @@ def migrate_data(targets, source):
 
 #@markdown ## 📍 b. Datasets generator
 
-def load_dataset(from_folder):
-    images = []
-    masks = []
-    content = sorted([f for f in os.listdir(os.path.join(root_folder, inputs_name)) if f.endswith('.tif')])
-    for c in content:
-        img = tifffile.imread(os.path.join(root_folder, inputs_name, c))
-        mask = tifffile.imread(os.path.join(root_folder, masks_name, c))
-        images.append(img)
-        masks.append(mask)
-    images = tf.constant(np.expand_dims(np.array(images), axis=-1))
-    masks = tf.constant(np.expand_dims(np.array(masks), axis=-1))
-    print(images.shape, masks.shape)
-    ds = tf.data.Dataset.from_tensor_slices((images, masks))
-    ds = ds.batch(batch_size).shuffle(buffer_size=100).prefetch(buffer_size=tf.data.AUTOTUNE)
+def open_pair(input_path, mask_path, img_only):
+    raw = tifffile.imread(input_path)
+    raw = np.expand_dims(raw, axis=-1)
+    image = tf.constant(raw, dtype=tf.float32)
+    raw = tifffile.imread(mask_path)
+    raw = np.expand_dims(raw, axis=-1)
+    mask = tf.constant(raw, dtype=tf.float32)
+    if img_only:
+        return image
+    else:
+        return (image, mask)
+
+def pairs_generator(src, img_only):
+    source = src.decode('utf-8')
+    _, l_files = get_data_sets(os.path.join(working_directory, source), [inputs_name], True)
+    l_files = sorted(list(l_files))
+    i = 0
+    while i < len(l_files):
+        input_path = os.path.join(working_directory, source, inputs_name, l_files[i])
+        mask_path = os.path.join(working_directory, source, masks_name, l_files[i])
+        yield open_pair(input_path, mask_path, img_only)
+        i += 1
+
+def make_dataset(source, img_only=False):
+    shape = get_shape()
+    
+    output_signature=tf.TensorSpec(shape=shape, dtype=tf.float32, name=None)
+    if not img_only:
+        output_signature = (output_signature, tf.TensorSpec(shape=shape, dtype=tf.uint8, name=None))
+    
+    ds = tf.data.Dataset.from_generator(
+        pairs_generator,
+        args=(source, img_only),
+        output_signature=output_signature
+    )
     return ds
+
+def test_ds_consumer():
+    batch = 20 # will be equivalent to the batch size
+    take = 10 # will be equivalent to the number of epochs
+    
+    ds_counter = make_dataset("training")
+    for i, (image, mask) in enumerate(ds_counter.repeat().batch(batch).take(take)):
+        print(f"{str(i+1).zfill(2)}: ", image.shape, mask.shape)
+
+    print("\n================\n")
+
+    ds_counter = make_dataset("training", True)
+    for i, image in enumerate(ds_counter.repeat().batch(batch).take(take)):
+        print(f"{str(i+1).zfill(2)}: ", image.shape)
+    
+    print("\nDONE.")
 
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
@@ -408,20 +446,6 @@ def load_dataset(from_folder):
 #@markdown # ⭐ 3. DATA AUGMENTATION
 
 #@markdown ## 📍 a. Data augmentation functions
-
-def rotation_90_step(image):
-    """
-    Applies a random rotation of 90, 180 or 270 degrees to the image.
-
-    Args:
-        image (tf.Tensor): The input image.
-    
-    Returns:
-        tf.Tensor: The rotated image.
-    """
-    angles = [0, 90, 180, 270]
-    angle = tf.random.shuffle(angles)[0]
-    return tf.image.rot90(image, k=angle // 90)
 
 def gamma_correction(image):
     """
@@ -434,7 +458,7 @@ def gamma_correction(image):
     Returns:
         tf.Tensor: The corrected image.
     """
-    gamma = tf.random.uniform(shape=[], minval=1.0 - gamma_range, maxval=1.0 + gamma_range)
+    gamma = tf.random.uniform(shape=[], minval=1.0 - 0.2, maxval=1.0 + 0.2)
     return tf.image.adjust_gamma(image, gamma=gamma)
 
 def normalize(image):
@@ -447,11 +471,11 @@ def normalize(image):
     Returns:
         tf.Tensor: The normalized image.
     """
-    m = np.min(image)
-    M = np.max(image)
+    m = tf.reduce_min(image)
+    M = tf.reduce_max(image)
     return (image - m) / (M - m)
 
-#@markdown ## 📍 b. Data augmentation layer
+#@markdown ## 📍 b. Data augmentation layer generator
 
 def generate_data_augment_layer():
     """
@@ -464,43 +488,52 @@ def generate_data_augment_layer():
     Returns:
         tf.keras.Sequential: The data augmentation layer.
     """
-    pipeline = []
     input_shape = get_shape()
+    pipeline = []
     if use_data_augmentation:
         if use_mirroring:
             pipeline.append(RandomFlip(mode='horizontal_and_vertical'))
         if use_gaussian_noise:
             pipeline.append(GaussianNoise(0.02))
-        if rotation_90:
-            pipeline.append(Lambda(rotation_90_step, output_shape=input_shape))
+        if use_random_rotations:
+            pipeline.append(RandomRotation(rotation_range_2_pi/100, fill_mode='reflect'))
         if use_gamma_correction:
             pipeline.append(Lambda(gamma_correction, output_shape=input_shape))
     pipeline.append(Lambda(normalize, output_shape=input_shape))
     return Sequential(pipeline)
 
-def visualize_augmentations(images_path, augmentation_layer, num_examples=5):
-    """
-    Creates a very basic model composed of an input layer and the augmentation layer.
-    Feeds the input image to the model to generate augmented images.
-    Displays a few examples of augmented images, from the same source.
-    """
-    image_name = random.choice(os.listdir(images_path))
-    image_path = os.path.join(images_path, image_name)
-    # Load and preprocess the image
-    image = tifffile.imread(image_path)
-    image = tf.expand_dims(image, axis=0)  # Add batch dimension
+#@markdown ## 📍 c. Data augmentation visualization
+
+def visualize_augmentations(augmentation_layer, num_examples=5, one_shot=True):
+    s = get_shape() 
+    ds = make_dataset("training", True).batch(1).take(num_examples)
+    grid_size = (2, num_examples) 
     
-    # Create a temporary model
-    inputs = Input(shape=image.shape[1:])
+    inputs = Input(shape=s)
     outputs = augmentation_layer(inputs)
     temp_model = Model(inputs, outputs)
-    
-    # Generate augmented images
-    fig, axes = plt.subplots(1, num_examples, figsize=(20, 20))
-    for i in range(num_examples):
-        augmented_image = temp_model(image, training=True)  # training=True to apply augmentation
-        axes[i].imshow(tf.squeeze(augmented_image).numpy())
+
+    # Prepare the grid for displaying images (two rows: one for original, one for augmented)
+    fig, axes = plt.subplots(grid_size[0], grid_size[1], figsize=(20, 10))
+    axes = axes.flatten()  # Flatten axes to easily index them
+
+    for i, img_batch in enumerate(ds):
+        if i >= num_examples:
+            break
+
+        original_image = img_batch[0].numpy()  # Convert Tensor to NumPy array
+
+        if one_shot:
+            augmented_image = temp_model(img_batch, training=True)[0].numpy()
+        else:
+            augmented_image = temp_model.predict(img_batch)[0]
+
+        axes[i].imshow(original_image[..., 0], cmap='gray')
         axes[i].axis('off')
+        axes[i + num_examples].imshow(augmented_image[..., 0], cmap='viridis') 
+        axes[i + num_examples].axis('off')
+
+    plt.tight_layout()
     plt.show()
 
 
@@ -672,7 +705,6 @@ def train_model(model, train_dataset, val_dataset):
         train_dataset,
         validation_data=val_dataset,
         epochs=epochs,
-        # steps_per_epoch=100,
         callbacks=[checkpoint, early_stopping, reduce_lr]
     )
 
@@ -689,6 +721,8 @@ def main():
     if not data_sanity or not qc_sanity:
         print(f"ABORT. 😱 Your {'data' if not data_sanity else 'QC data'} is not consistent. Use the content of the sanity check table above to fix all that and try again.")
         return
+    else:
+        print("👍 Your data looks alright!")
     
     # 2. Migrate the data locally
     create_local_dirs(reset_local_data)
@@ -701,29 +735,29 @@ def main():
             ("testing", 1.0)
             ], qc_folder)
     
-    return
-    # 2. Preview the effects of data augmentation
-    images_path = os.path.join(data_folder, inputs_name)
-    visualize_augmentations(images_path, generate_data_augment_layer(), 10)
+    # 3. Preview the effects of data augmentation
+    if show_preview:
+        augmentation_layer = generate_data_augment_layer()
+        visualize_augmentations(augmentation_layer)
 
-    # 3. Creating the model
+    # 4. Creating the model
     model = instanciate_model()
     model.summary()
 
-    # 4. Migrating the data
-    create_local_dirs()
-    migrate_data()
-
-    training_dataset   = load_dataset(os.path.join(working_directory, "training"))
-    validation_dataset = load_dataset(os.path.join(working_directory, "validation"))
-    testing_dataset    = None
-
+    # 5. Create the datasets
+    training_dataset   = make_dataset("training").repeat().batch(batch_size).take(batch_size)
+    validation_dataset = make_dataset("validation").repeat().batch(batch_size).take(batch_size)
+    print(f"   • Training dataset: {len(list(training_dataset))} ({training_dataset}).")
+    print(f"   • Validation dataset: {len(list(validation_dataset))} ({validation_dataset}).")
+    
+    testing_dataset = None
     if qc_folder is not None:
-        testing_dataset = load_dataset(os.path.join(working_directory, "testing"))
+        testing_dataset = make_dataset("testing").repeat().batch(batch_size).take(batch_size)
+        print(f"   • Testing dataset: {len(list(testing_dataset))} ({testing_dataset}).")
     else:
-        print("😱 No quality control will be performed.")
-
-    # 5. Training the model
+        print("   • No testing dataset provided.")
+    
+    # 6. Training the model
     history = train_model(model, training_dataset, validation_dataset)
 
 if __name__ == "__main__":
