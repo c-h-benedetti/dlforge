@@ -6,26 +6,21 @@ import os
 import shutil
 import re
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-
-import tensorflow as tf
-from tensorflow.keras.models import Model, Sequential
-from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
-from tensorflow.keras.layers import (Input, Conv2D, MaxPooling2D, RandomRotation,
-                                     UpSampling2D, concatenate, Dropout,
-                                     RandomFlip, GaussianNoise, Lambda)
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import ModelCheckpoint, TensorBoard
-from tensorflow.keras.utils import plot_model
-from tensorflow.keras import layers, models
-from tensorflow.keras import backend as K
-from tensorflow.keras.losses import BinaryCrossentropy
-from tensorflow.keras.layers import Activation
-
+from scipy.ndimage import rotate
 import pandas as pd
 from tabulate import tabulate
 
-from tqdm import tqdm
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.callbacks import (ModelCheckpoint, EarlyStopping,
+                                        ReduceLROnPlateau, TensorBoard, Callback)
+from tensorflow.keras.layers import (Input, Conv2D, MaxPooling2D, Dropout,
+                                     UpSampling2D, concatenate, Activation)
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.utils import plot_model
+from tensorflow.keras.losses import BinaryCrossentropy
 
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
@@ -36,65 +31,66 @@ from tqdm import tqdm
 
 """
 
-- `data_folder`: Folder in which we can find the images and masks folders.
-- `qc_folder`: Folder in which we can find the quality control images and masks folders.
-- `inputs_name`: Name of the folder containing the input images (name of the folder in `data_folder` and `qc_folder`.).
-- `masks_name`: Name of the folder containing the masks (name of the folder in `data_folder` and `qc_folder`.).
-- `models_path`: Folder in which the models will be saved. They will be saved as "{model_name_prefix}-V{version_number}".
+- `data_folder`      : Folder in which we can find the images and masks folders.
+- `qc_folder`        : Folder in which we can find the quality control images and masks folders.
+- `inputs_name`      : Name of the folder containing the input images (name of the folder in `data_folder` and `qc_folder`.).
+- `masks_name`       : Name of the folder containing the masks (name of the folder in `data_folder` and `qc_folder`.).
+- `models_path`      : Folder in which the models will be saved. They will be saved as "{model_name_prefix}-V{version_number}".
 - `working_directory`: Folder in which the training, validation and testing folders will be created.
 - `model_name_prefix`: Prefix of the model name. Will be part of the folder name in `models_path`.
-- `reset_local_data`: If True, the locally copied training, validation and testing folders will be re-imported.
+- `reset_local_data` : If True, the locally copied training, validation and testing folders will be re-imported.
 
 - `validation_percentage`: Percentage of the data that will be used for validation. This data will be moved to the validation folder.
-- `batch_size`: Number of images per batch.
-- `epochs`: Number of epochs for the training.
-- `unet_depth`: Depth of the UNet model == number of layers in the encoder part (== number of layers in the decoder part).
-- `num_filters_start`: Number of filters in the first layer of the UNet.
-- `dropout_rate`: Dropout rate.
-- `optimizer`: Optimizer used for the training.
-- `learning_rate`: Learning rate of the optimizer.
+- `batch_size`           : Number of images per batch.
+- `epochs`               : Number of epochs for the training.
+- `unet_depth`           : Depth of the UNet model == number of layers in the encoder part (== number of layers in the decoder part).
+- `num_filters_start`    : Number of filters in the first layer of the UNet.
+- `dropout_rate`         : Dropout rate.
+- `optimizer`            : Optimizer used for the training.
+- `learning_rate`        : Learning rate of the optimizer.
 
 - `use_data_augmentation`: If True, data augmentation will be used.
-- `use_mirroring`: If True, random mirroring will be used.
-- `use_gaussian_noise`: If True, random gaussian noise will be used.
-- `use_random_rotations`: If True, random rotation of 90, 180 or 270 degrees will be used.
-- `use_gamma_correction`: If True, random gamma correction will be used.
-- `gamma_range`: Range of the gamma correction. The gamma will be in [1 - gamma_range, 1 + gamma_range] (1.0 == neutral).
+- `use_mirroring`        : If True, random mirroring will be used.
+- `use_gaussian_noise`   : If True, random gaussian noise will be used.
+- `use_random_rotations` : If True, random rotation of 90, 180 or 270 degrees will be used.
+- `use_gamma_correction` : If True, random gamma correction will be used.
+- `gamma_range`          : Range of the gamma correction. The gamma will be in [1 - gamma_range, 1 + gamma_range] (1.0 == neutral).
 
 """
 
 #@markdown ## 📍 a. Data paths
-data_folder       = "/home/benedetti/Desktop/eaudissect/training-gt/V001/"    #@param {type: "string"}
-qc_folder         = None                                                      #@param {type: "string"}
-inputs_name       = "input"                                                   #@param {type: "string"}
-masks_name        = "raw-labels"                                              #@param {type: "string"}
-models_path       = "/home/benedetti/Desktop/eaudissect/output_folder/models" #@param {type: "string"}
-working_directory = "/home/benedetti/Desktop/eaudissect/local/"               #@param {type: "string"}
-model_name_prefix = "UNet2D"                                                  #@param {type: "string"}
-reset_local_data  = True                                                      #@param {type: "boolean"}
-remove_wrong_data = True                                                      #@param {type: "boolean"}
+
+data_folder       = "/home/benedetti/Desktop/eaudissect/training-gt/V001/"
+qc_folder         = None
+inputs_name       = "input"
+masks_name        = "raw-labels"
+models_path       = "/home/benedetti/Desktop/eaudissect/output_folder/models"
+working_directory = "/home/benedetti/Desktop/eaudissect/local/"
+model_name_prefix = "UNet2D"
+reset_local_data  = True
+remove_wrong_data = True
 
 #@markdown ## 📍 b. Network architecture
 
-validation_percentage = 0.15   #@param {type: "slider", min: 0.05, max: 0.95, step:0.05}
-batch_size            = 120    #@param {type: "integer"}
-epochs                = 50     #@param {type: "integer"}
-unet_depth            = 4      #@param {type: "integer"}
-num_filters_start     = 16     #@param {type: "integer"}
-dropout_rate          = 0.25   #@param {type: "slider", min: 0.0, max: 0.5, step: 0.05}
-optimizer             = 'Adam' #@param ["Adam", "SGD", "RMSprop"]
-learning_rate         = 0.0001 #@param {type: "number"}
+validation_percentage = 0.15
+batch_size            = 120
+epochs                = 50
+unet_depth            = 4
+num_filters_start     = 16
+dropout_rate          = 0.25
+optimizer             = 'Adam'
+learning_rate         = 0.0001
 
 #@markdown ## 📍 c. Data augmentation
 
-use_data_augmentation = True  #@param {type: "boolean"}
-use_mirroring         = True  #@param {type: "boolean"}
-use_gaussian_noise    = True  #@param {type: "boolean"}
-use_random_rotations  = True  #@param {type: "boolean"}
-rotation_range_2_pi   = 100   #@param {type: "slider", min: 1, max: 100, step: 1}
-use_gamma_correction  = True  #@param {type: "boolean"}
-gamma_range           = 0.6   #@param {type: "slider", min:0.1, max:1.0}
-show_preview          = False #@param {type: "boolean"}
+use_data_augmentation = True
+use_mirroring         = True
+use_gaussian_noise    = True
+use_random_rotations  = True
+angle_range           = (-30, 30)
+use_gamma_correction  = True
+gamma_range           = (0.2, 4.0)
+show_preview          = False
 
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
@@ -119,7 +115,7 @@ The following checks will be performed:
 # Regex matching a TIFF file, whatever the case and the number of 'f'.
 _TIFF_REGEX = r".+\.tiff?"
 
-def get_data_sets(root_folder, folders, tif_only=False):
+def get_data_pools(root_folder, folders, tif_only=False):
     """
     Aims to return the files available for training in every folder (not path).
     Probes the content of the data folders provided by the user.
@@ -153,7 +149,7 @@ def get_shape():
     Returns:
         tuple: The shape of the input image.
     """
-    _, l_files = get_data_sets(data_folder, [inputs_name], True)
+    _, l_files = get_data_pools(data_folder, [inputs_name], True)
     input_path = os.path.join(data_folder, inputs_name, list(l_files)[0])
     raw = tifffile.imread(input_path)
     s = raw.shape
@@ -172,8 +168,8 @@ def is_extension_correct(root_folder, folders):
     Returns:
         dict: Keys are files, values are booleans. True if the file is a TIFF image, False otherwise.
     """
-    _, all_data = get_data_sets(root_folder, folders)
-    _, all_tiff = get_data_sets(root_folder, folders, True)
+    _, all_data = get_data_pools(root_folder, folders)
+    _, all_tiff = get_data_pools(root_folder, folders, True)
     extensions = {k: (k in all_tiff) for k in all_data}
     return extensions
 
@@ -188,7 +184,7 @@ def is_data_shape_identical(root_folder, folders):
     Returns:
         dict: Keys are files, values are booleans. True if the shape is identical, False otherwise.
     """
-    _, all_data = get_data_sets(root_folder, folders, True)
+    _, all_data = get_data_pools(root_folder, folders, True)
     ref_size = None
     shapes = {k: False for k in all_data}
     for file in all_data:
@@ -215,7 +211,7 @@ def is_data_useful(root_folder, folders):
     """
     images_path = os.path.join(root_folder, inputs_name)
     masks_path = os.path.join(root_folder, masks_name)
-    _, all_data = get_data_sets(root_folder, folders, True)
+    _, all_data = get_data_pools(root_folder, folders, True)
     useful_data = {k: False for k in all_data}
 
     for file in all_data:
@@ -247,7 +243,7 @@ def is_matching_data(root_folder, folders):
     Returns:
         dict: Keys are files, values are booleans. True if the file is present everywhere, False otherwise.
     """
-    pools, all_data = get_data_sets(root_folder, folders)
+    pools, all_data = get_data_pools(root_folder, folders)
     matching_data   = {k: False for k in all_data}
     for data in all_data:
         status = [False for _ in range(len(folders))]
@@ -299,7 +295,7 @@ def apply_verbose(results):
 def sanity_check(root_folder):
     folders = [inputs_name, masks_name]
     results = {}
-    _, all_data = get_data_sets(root_folder, folders)
+    _, all_data = get_data_pools(root_folder, folders)
     false_data = {k: False for k in all_data}
     for name, func in _SANITY_CHECK:
         results[name] = func(root_folder, folders)
@@ -396,7 +392,7 @@ def migrate_data(targets, source):
     if not check_sum(targets):
         raise ValueError("The sum of the ratios must be equal to 1.")
     folders = [inputs_name, masks_name]
-    _, all_data = get_data_sets(source, folders, True)
+    _, all_data = get_data_pools(source, folders, True)
     all_data = list(all_data)
     random.shuffle(all_data)
     last = 0
@@ -407,32 +403,179 @@ def migrate_data(targets, source):
         last += n
 
 
-#@markdown ## 📍 b. Datasets generator
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+#                            DATA AUGMENTATION                                    #
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
-def open_pair(input_path, mask_path, img_only):
-    raw = tifffile.imread(input_path)
-    raw = np.expand_dims(raw, axis=-1)
-    image = tf.constant(raw, dtype=tf.float32)
-    raw = (tifffile.imread(mask_path) > 0).astype(np.uint8)
-    raw = np.expand_dims(raw, axis=-1)
-    mask = tf.constant(raw, dtype=tf.uint8)
+#@markdown # ⭐ 4. DATA AUGMENTATION
+
+#@markdown ## 📍 a. Data augmentation functions
+
+def random_flip(image, mask):
+    """
+    Applies a random horizontal or vertical flip to both the image and the mask.
+    
+    Args:
+        image (np.ndarray): The input image.
+        mask (np.ndarray): The input mask.
+        
+    Returns:
+        (np.ndarray, np.ndarray): The flipped image and mask.
+    """
+    # Horizontal flip
+    if np.random.rand() > 0.5:
+        image = np.fliplr(image)
+        mask = np.fliplr(mask)
+    
+    # Vertical flip
+    if np.random.rand() > 0.5:
+        image = np.flipud(image)
+        mask = np.flipud(mask)
+    
+    return image, mask
+
+def random_rotation(image, mask):
+    """
+    Applies a random rotation (by any angle) to both the image and the mask.
+    The image uses bilinear interpolation, while the mask uses nearest-neighbor interpolation to avoid grayscale artifacts.
+    
+    Args:
+        image (np.ndarray): The input image.
+        mask (np.ndarray): The input mask.
+        angle_range (tuple): The range of angles (in degrees) from which to sample the random rotation angle.
+        
+    Returns:
+        (np.ndarray, np.ndarray): The rotated image and mask.
+    """
+    angle = np.random.uniform(angle_range[0], angle_range[1])
+    rotated_image = rotate(image, angle, reshape=False, order=1, mode='reflect')
+    rotated_mask = rotate(mask, angle, reshape=False, order=0, mode='reflect')
+    
+    return rotated_image, rotated_mask
+
+def gamma_correction(image, mask):
+    """
+    Applies a random gamma correction to the image. The mask remains unchanged.
+    
+    Args:
+        image (np.ndarray): The input image.
+        mask (np.ndarray): The input mask.
+        gamma_range (tuple): The range from which to sample the gamma value.
+        
+    Returns:
+        (np.ndarray, np.ndarray): The gamma-corrected image and the unchanged mask.
+    """
+    gamma = np.random.uniform(gamma_range[0], gamma_range[1])
+    image = np.power(image, gamma)
+    
+    return image, mask
+
+def normalize(image, mask):
+    """
+    Normalizes the image values to be between 0 and 1. The mask remains unchanged.
+    
+    Args:
+        image (np.ndarray): The input image.
+        mask (np.ndarray): The input mask.
+        
+    Returns:
+        (np.ndarray, np.ndarray): The normalized image and the unchanged mask.
+    """
+    min_val = np.min(image)
+    max_val = np.max(image)
+    
+    normalized_image = (image - min_val) / (max_val - min_val)
+    
+    return normalized_image, mask
+
+def apply_data_augmentation(image, mask):
+    """
+    Applies all the data augmentation functions to the image and the mask.
+
+    Args:
+        image (tf.Tensor): The input image.
+        mask (tf.Tensor): The input mask.
+    
+    Returns:
+        (tf.Tensor, tf.Tensor): The augmented image and mask.
+    """
+    if use_mirroring:
+        image, mask = random_flip(image, mask)
+    if use_random_rotations:
+        image, mask = random_rotation(image, mask)
+    if use_gamma_correction:
+        image, mask = gamma_correction(image, mask)
+    image, mask = normalize(image, mask)
+    return image, mask
+
+#@markdown ## 📍 b. Datasets visualization
+
+def visualize_augmentations(num_examples=5):
+    """
+    Visualizes original and augmented images side by side.
+    
+    Args:
+        num_examples (int): The number of examples to visualize.
+    """
+    s = get_shape()
+    ds = make_dataset("training", True).batch(1).take(num_examples)
+
+    grid_size = (2, num_examples)
+    fig, axes = plt.subplots(*grid_size, figsize=(15, 6))
+
+    for i, (augmented_image, original_image) in enumerate(ds):
+        if i >= num_examples:
+            break
+        
+        augmented_image = augmented_image[0].numpy()
+        original_image = original_image[0].numpy()
+        
+        axes[0, i].imshow(original_image)
+        axes[0, i].set_title(f"Mask {i+1}")
+        axes[0, i].axis('off')
+        
+        axes[1, i].imshow(augmented_image)
+        axes[1, i].set_title(f"Input {i+1}")
+        axes[1, i].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+#                            DATASET GENERATOR                                    #
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+#@markdown # ⭐ 5. DATASET GENERATOR
+
+#@markdown ## 📍 a. Datasets generator
+
+def open_pair(input_path, mask_path, training, img_only):
+    raw_img = tifffile.imread(input_path)
+    raw_img = np.expand_dims(raw_img, axis=-1)
+    raw_mask = (tifffile.imread(mask_path) > 0).astype(np.uint8)
+    raw_mask = np.expand_dims(raw_mask, axis=-1)
+    if training:
+        raw_img, raw_mask = apply_data_augmentation(raw_img, raw_mask)
+    image = tf.constant(raw_img, dtype=tf.float32)
+    mask = tf.constant(raw_mask, dtype=tf.uint8)
     if img_only:
         return image
     else:
         return (image, mask)
 
-def pairs_generator(src, img_only):
+def pairs_generator(src, training, img_only):
     source = src.decode('utf-8')
-    _, l_files = get_data_sets(os.path.join(working_directory, source), [inputs_name], True)
+    _, l_files = get_data_pools(os.path.join(working_directory, source), [inputs_name], True)
     l_files = sorted(list(l_files))
     i = 0
     while i < len(l_files):
         input_path = os.path.join(working_directory, source, inputs_name, l_files[i])
         mask_path = os.path.join(working_directory, source, masks_name, l_files[i])
-        yield open_pair(input_path, mask_path, img_only)
+        yield open_pair(input_path, mask_path, training, img_only)
         i += 1
 
-def make_dataset(source, img_only=False):
+def make_dataset(source, training=False, img_only=False):
     shape = get_shape()
     
     output_signature=tf.TensorSpec(shape=shape, dtype=tf.float32, name=None)
@@ -441,7 +584,7 @@ def make_dataset(source, img_only=False):
     
     ds = tf.data.Dataset.from_generator(
         pairs_generator,
-        args=(source, img_only),
+        args=(source, training, img_only),
         output_signature=output_signature
     )
     return ds
@@ -450,13 +593,13 @@ def test_ds_consumer():
     batch = 20 # will be equivalent to the batch size
     take = 10 # will be equivalent to the number of epochs
     
-    ds_counter = make_dataset("training")
+    ds_counter = make_dataset("training", True)
     for i, (image, mask) in enumerate(ds_counter.repeat().batch(batch).take(take)):
         print(f"{str(i+1).zfill(2)}: ", image.shape, mask.shape)
 
     print("\n================\n")
 
-    ds_counter = make_dataset("training", True)
+    ds_counter = make_dataset("training", False, True)
     for i, image in enumerate(ds_counter.repeat().batch(batch).take(take)):
         print(f"{str(i+1).zfill(2)}: ", image.shape)
     
@@ -464,109 +607,10 @@ def test_ds_consumer():
 
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
-#                            DATA AUGMENTATION                                    #
-# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
-
-#@markdown # ⭐ 3. DATA AUGMENTATION
-
-#@markdown ## 📍 a. Data augmentation functions
-
-def gamma_correction(image):
-    """
-    Applies a random γ-correction to the image.
-    γ == 1.0 > no change
-
-    Args:
-        image (tf.Tensor): The input image.
-    
-    Returns:
-        tf.Tensor: The corrected image.
-    """
-    gamma = tf.random.uniform(shape=[], minval=1.0 - 0.2, maxval=1.0 + 0.2)
-    return tf.image.adjust_gamma(image, gamma=gamma)
-
-def normalize(image):
-    """
-    Normalizes the image to have values between 0 and 1.
-
-    Args:
-        image (tf.Tensor): The input image.
-    
-    Returns:
-        tf.Tensor: The normalized image.
-    """
-    m = tf.reduce_min(image)
-    M = tf.reduce_max(image)
-    return (image - m) / (M - m)
-
-#@markdown ## 📍 b. Data augmentation layer generator
-
-def generate_data_augment_layer():
-    """
-    Generates a data augmentation layer.
-    It takes the form of a Sequential layer to be plugged after the input layer of the model.
-    Augmentation layers are disabled at inference.
-    If the data augmentation is disabled, the layer only normalizes the input.
-    Order of transform: flip, noise, rotation, gamma correction, normalization.
-
-    Returns:
-        tf.keras.Sequential: The data augmentation layer.
-    """
-    input_shape = get_shape()
-    pipeline = []
-    if use_data_augmentation:
-        if use_mirroring:
-            pipeline.append(RandomFlip(mode='horizontal_and_vertical'))
-        if use_gaussian_noise:
-            pipeline.append(GaussianNoise(0.02))
-        if use_random_rotations:
-            pipeline.append(RandomRotation(rotation_range_2_pi/100, fill_mode='reflect'))
-        if use_gamma_correction:
-            pipeline.append(Lambda(gamma_correction, output_shape=input_shape))
-    pipeline.append(Lambda(normalize, output_shape=input_shape))
-    return Sequential(pipeline)
-
-#@markdown ## 📍 c. Data augmentation visualization
-
-def visualize_augmentations(augmentation_layer, num_examples=5, one_shot=True):
-    s = get_shape() 
-    ds = make_dataset("training", True).batch(1).take(num_examples)
-    grid_size = (2, num_examples) 
-    
-    inputs = Input(shape=s)
-    outputs = augmentation_layer(inputs)
-    temp_model = Model(inputs, outputs)
-
-    # Prepare the grid for displaying images (two rows: one for original, one for augmented)
-    fig, axes = plt.subplots(grid_size[0], grid_size[1], figsize=(20, 10))
-    axes = axes.flatten()  # Flatten axes to easily index them
-
-    for i, img_batch in enumerate(ds):
-        if i >= num_examples:
-            break
-
-        original_image = img_batch[0].numpy()  # Convert Tensor to NumPy array
-
-        if one_shot:
-            augmented_image = temp_model(img_batch, training=True)[0].numpy()
-        else:
-            augmented_image = temp_model.predict(img_batch)[0]
-
-        axes[i].imshow(original_image[..., 0], cmap='gray')
-        axes[i].axis('off')
-        axes[i + num_examples].imshow(augmented_image[..., 0], cmap='viridis') 
-        axes[i + num_examples].axis('off')
-
-    plt.tight_layout()
-    plt.show()
-
-
-
-# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 #                            MODEL GENERATOR                                      #
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
-#@markdown # ⭐ 4. MODEL GENERATOR
+#@markdown # ⭐ 6. MODEL GENERATOR
 
 #@markdown ## 📍 a. Utils
 
@@ -594,7 +638,7 @@ def create_unet2d_model(input_shape):
     Generates a UNet2D model with ReLU activations after each Conv2D layer.
     """
     inputs = Input(shape=input_shape)
-    x = generate_data_augment_layer()(inputs)
+    x = inputs
 
     # Encoder:
     skip_connections = []
@@ -625,26 +669,6 @@ def create_unet2d_model(input_shape):
     model = Model(inputs=inputs, outputs=outputs)
     return model
 
-def make_test_model(input_shape):
-    model = models.Sequential([
-        layers.Input(shape=input_shape),
-        layers.Conv2D(16, (3, 3), activation='relu', padding='same'),
-        layers.MaxPooling2D((2, 2)),
-        layers.Conv2D(32, (3, 3), activation='relu', padding='same'),
-        layers.MaxPooling2D((2, 2)),
-        layers.Conv2D(64, (3, 3), activation='relu', padding='same'),
-        
-        # Utiliser UpSampling pour restaurer la taille des images
-        layers.UpSampling2D((2, 2)),
-        layers.Conv2D(32, (3, 3), activation='relu', padding='same'),
-        layers.UpSampling2D((2, 2)),
-        layers.Conv2D(16, (3, 3), activation='relu', padding='same'),
-        
-        # Couche de sortie pour prédiction du masque
-        layers.Conv2D(1, (1, 1), activation='sigmoid', padding='same')
-    ])
-    
-    return model
 
 #@markdown ## 📍 c. Alternative loss functions
 
@@ -672,7 +696,7 @@ def focal_loss(gamma=2., alpha=0.25):
         y_pred = tf.cast(y_pred, tf.float32)
         alpha_t = y_true * alpha + (1 - y_true) * (1 - alpha)
         p_t = y_true * y_pred + (1 - y_true) * (1 - y_pred)
-        fl = - alpha_t * (1 - p_t) ** gamma * tf.math.log(p_t + K.epsilon())
+        fl = - alpha_t * (1 - p_t) ** gamma * tf.math.log(p_t + 1e-5)
         return tf.reduce_mean(fl)
     return focal_loss_fixed
 
@@ -693,16 +717,13 @@ def instanciate_model():
     model = create_unet2d_model(input_shape)
     model.compile(
         optimizer=Adam(learning_rate=learning_rate), 
-        loss= BinaryCrossentropy(), #dice_loss, 
-        # metrics=[
-        #     tf.keras.metrics.FalseNegatives(),
-        #     tf.keras.metrics.FalsePositives(),
-        #     tf.keras.metrics.TrueNegatives(),
-        #     tf.keras.metrics.TruePositives(),
-        #     tf.keras.metrics.Precision(),
-        #     tf.keras.metrics.Recall(),
-        #     tf.keras.metrics.Accuracy()
-        # ]
+        loss=focal_loss, 
+        metrics=[
+            tf.keras.metrics.Precision(),
+            tf.keras.metrics.Recall(),
+            tf.keras.metrics.Accuracy(),
+            tf.keras.metrics.MeanIoU(num_classes=2)
+        ]
     )
     return model
 
@@ -711,9 +732,45 @@ def instanciate_model():
 #                            TRAINING THE MODEL                                   #
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
-#@markdown # ⭐ 5. TRAINING THE MODEL
+#@markdown # ⭐ 7. TRAINING THE MODEL
 
-#@markdown ## 📍 a. Training launcher
+#@markdown ## 📍 a. Creating callback for validation
+
+class SavePredictionsCallback(Callback):
+    def __init__(self, num_examples=5):
+        """
+        Custom callback to save predictions to images at the end of each epoch.
+
+        Args:
+            validation_data (tf.data.Dataset): The validation dataset to predict on.
+            output_dir (str): The directory where images will be saved.
+            num_examples (int): The number of examples to save at each epoch.
+        """
+        super().__init__()
+        self.validation_data = make_dataset("validation", False)
+        self.output_dir = os.path.join(working_directory, "predictions")
+        self.num_examples = num_examples
+
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+
+    def on_epoch_end(self, epoch, logs=None):
+        val_images, val_masks = next(iter(self.validation_data.batch(self.num_examples)))
+        predictions = self.model.predict(val_images)
+
+        # Create a subfolder for each epoch
+        epoch_dir = os.path.join(self.output_dir, f'epoch_{epoch + 1}')
+        if not os.path.exists(epoch_dir):
+            os.makedirs(epoch_dir)
+
+        # Save the results (input, predicted mask, and ground truth mask)
+        for i in range(self.num_examples):
+            tifffile.imwrite(os.path.join(epoch_dir, f'input_{str(i + 1).zfill(5)}.tif'), val_images[i].numpy())
+            tifffile.imwrite(os.path.join(epoch_dir, f'mask_{str(i + 1).zfill(5)}.tif'), val_masks[i].numpy())
+            tifffile.imwrite(os.path.join(epoch_dir, f'prediction_{str(i + 1).zfill(5)}.tif'), predictions[i])
+            
+
+#@markdown ## 📍 b. Training launcher
 
 def train_model(model, train_dataset, val_dataset):
     # Path of the folder in which the model is exported.
@@ -721,6 +778,7 @@ def train_model(model, train_dataset, val_dataset):
     version_name = f"{model_name_prefix}-V{str(v).zfill(3)}"
     output_path = os.path.join(models_path, version_name)
     os.makedirs(output_path)
+    plot_model(model, to_file=os.path.join(output_path, 'architecture.png'), show_shapes=True)
 
     print(f"💾 Exporting model to: {output_path}")
 
@@ -732,12 +790,69 @@ def train_model(model, train_dataset, val_dataset):
         train_dataset,
         validation_data=val_dataset,
         epochs=epochs,
-        callbacks=[checkpoint, early_stopping, reduce_lr],
+        callbacks=[checkpoint, early_stopping, reduce_lr, SavePredictionsCallback()],
         verbose=1
     )
 
     model.save(os.path.join(output_path, 'last.keras'))
     return history
+
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+#                            EVALUATE THE MODEL                                   #
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+#@markdown # ⭐ 8. EVALUATE THE MODEL
+
+def plot_training_history(history):
+    """
+    Plots the training and validation metrics from the model's history.
+
+    Args:
+        history (History): The history object returned by model.fit().
+    """
+    # Retrieve metrics from history
+    metrics = history.history
+    
+    # Create subplots
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    
+    # Plot Training and Validation Loss
+    axes[0, 0].plot(metrics['loss'], label='Training Loss')
+    axes[0, 0].plot(metrics['val_loss'], label='Validation Loss')
+    axes[0, 0].set_title('Loss')
+    axes[0, 0].set_xlabel('Epochs')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].legend()
+
+    # Plot IoU (Jaccard Index) if available
+    if 'iou' in metrics:
+        axes[1, 0].plot(metrics['iou'], label='Training IoU')
+        axes[1, 0].plot(metrics['val_iou'], label='Validation IoU')
+        axes[1, 0].set_title('Intersection over Union (IoU)')
+        axes[1, 0].set_xlabel('Epochs')
+        axes[1, 0].set_ylabel('IoU')
+        axes[1, 0].legend()
+
+    # Plot Precision and Recall if available
+    if 'precision' in metrics and 'recall' in metrics:
+        axes[1, 1].plot(metrics['precision'], label='Training Precision')
+        axes[1, 1].plot(metrics['val_precision'], label='Validation Precision')
+        axes[1, 1].plot(metrics['recall'], label='Training Recall')
+        axes[1, 1].plot(metrics['val_recall'], label='Validation Recall')
+        axes[1, 1].set_title('Precision and Recall')
+        axes[1, 1].set_xlabel('Epochs')
+        axes[1, 1].set_ylabel('Metric Value')
+        axes[1, 1].legend()
+
+    # Adjust layout
+    plt.tight_layout()
+    plt.show()
+
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+#                              MAIN FUNCTION                                      #
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
 
 def main():
@@ -746,9 +861,8 @@ def main():
     # 1. Running the sanity checks
     data_sanity, results = sanity_check(data_folder)
     qc_sanity = True
-    results_qc = None
     if qc_folder is not None:
-        qc_sanity, results_qc = sanity_check(qc_folder)
+        qc_sanity, _ = sanity_check(qc_folder)
     
     if not data_sanity:
         if remove_wrong_data:
@@ -759,7 +873,9 @@ def main():
     else:
         print("👍 Your training data looks alright!")
 
-    if qc_folder is not None and not qc_sanity:
+    if qc_folder is None:
+        print("🚨 No QC data provided.")
+    elif not qc_sanity:
         print("🚨 Your QC data is not consistent. Use the content of the sanity check table above to fix all that and try again.")
     else:
         print("👍 Your QC data looks alright!")
@@ -777,22 +893,21 @@ def main():
     
     # 3. Preview the effects of data augmentation
     if show_preview:
-        augmentation_layer = generate_data_augment_layer()
-        visualize_augmentations(augmentation_layer)
+        visualize_augmentations()
 
     # 4. Creating the model
     model = instanciate_model()
     model.summary()
 
     # 5. Create the datasets
-    training_dataset   = make_dataset("training").repeat().batch(batch_size).take(batch_size)
-    validation_dataset = make_dataset("validation").repeat().batch(16).take(16)
+    training_dataset   = make_dataset("training", True).repeat().batch(batch_size).take(batch_size)
+    validation_dataset = make_dataset("validation", False).repeat().batch(16).take(16)
     print(f"   • Training dataset: {len(list(training_dataset))} ({training_dataset}).")
     print(f"   • Validation dataset: {len(list(validation_dataset))} ({validation_dataset}).")
     
     testing_dataset = None
     if qc_folder is not None:
-        testing_dataset = make_dataset("testing").repeat().batch(batch_size).take(batch_size)
+        testing_dataset = make_dataset("testing", False).repeat().batch(batch_size).take(batch_size)
         print(f"   • Testing dataset: {len(list(testing_dataset))} ({testing_dataset}).")
     else:
         print("   • No testing dataset provided.")
