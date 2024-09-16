@@ -19,6 +19,8 @@ from tensorflow.keras.callbacks import ModelCheckpoint, TensorBoard
 from tensorflow.keras.utils import plot_model
 from tensorflow.keras import layers, models
 from tensorflow.keras import backend as K
+from tensorflow.keras.losses import BinaryCrossentropy
+from tensorflow.keras.layers import Activation
 
 import pandas as pd
 from tabulate import tabulate
@@ -62,25 +64,26 @@ from tqdm import tqdm
 """
 
 #@markdown ## 📍 a. Data paths
-data_folder       = "/home/benedetti/Desktop/eaudissect/output_folder/"       #@param {type: "string"}
+data_folder       = "/home/benedetti/Desktop/eaudissect/training-gt/V001/"    #@param {type: "string"}
 qc_folder         = None                                                      #@param {type: "string"}
-inputs_name       = "images"                                                  #@param {type: "string"}
-masks_name        = "outlines"                                                #@param {type: "string"}
+inputs_name       = "input"                                                   #@param {type: "string"}
+masks_name        = "raw-labels"                                              #@param {type: "string"}
 models_path       = "/home/benedetti/Desktop/eaudissect/output_folder/models" #@param {type: "string"}
 working_directory = "/home/benedetti/Desktop/eaudissect/local/"               #@param {type: "string"}
 model_name_prefix = "UNet2D"                                                  #@param {type: "string"}
 reset_local_data  = True                                                      #@param {type: "boolean"}
+remove_wrong_data = True                                                      #@param {type: "boolean"}
 
 #@markdown ## 📍 b. Network architecture
 
 validation_percentage = 0.15   #@param {type: "slider", min: 0.05, max: 0.95, step:0.05}
-batch_size            = 16     #@param {type: "integer"}
+batch_size            = 120    #@param {type: "integer"}
 epochs                = 50     #@param {type: "integer"}
 unet_depth            = 4      #@param {type: "integer"}
 num_filters_start     = 16     #@param {type: "integer"}
 dropout_rate          = 0.25   #@param {type: "slider", min: 0.0, max: 0.5, step: 0.05}
 optimizer             = 'Adam' #@param ["Adam", "SGD", "RMSprop"]
-learning_rate         = 0.001  #@param {type: "number"}
+learning_rate         = 0.0001 #@param {type: "number"}
 
 #@markdown ## 📍 c. Data augmentation
 
@@ -223,9 +226,11 @@ def is_data_useful(root_folder, folders):
         img_data = tifffile.imread(img_path)
         mask_data = tifffile.imread(mask_path)
         s = True
+        if np.nan in set(np.unique(mask_data)).union(set(np.unique(img_data))):
+            s = False
         if np.max(img_data) - np.min(img_data) < 1e-6:
             s = False
-        if len(np.unique(mask_data)) != 2: # Binary mask
+        if len(np.unique(mask_data)) < 2: # Want binary mask or labels
             s = False
         useful_data[file] = s
     return useful_data
@@ -282,7 +287,7 @@ _INSANITIES = {
 }
 
 def apply_verbose(results):
-    verbose = results.copy()
+    verbose = {k: v.copy() for k, v in results.items()}
     for test, pool in results.items():
         for file, status in pool.items():
             if not status:
@@ -304,7 +309,26 @@ def sanity_check(root_folder):
     df = pd.DataFrame(verbose)
     df = df.sort_index()
     print(tabulate(df, headers='keys', tablefmt='fancy_grid'))
-    return all(assessment)
+    return (all(assessment), results)
+
+
+#@markdown ## 📍 c. Remove dirty data
+
+def remove_dirty_data(root_folder, folders, results):
+    """
+    Removes the files that are not useful.
+    """
+    trash_path = os.path.join(working_directory, "trash")
+    for f in folders:
+        os.makedirs(os.path.join(trash_path, f), exist_ok=True)
+    for test, pool in results.items():
+        for file, status in pool.items():
+            if not status:
+                for f in folders:
+                    path = os.path.join(root_folder, f, file)
+                    if os.path.isfile(path):
+                        shutil.move(path, os.path.join(trash_path, f, file))
+    print(f"🗑️  Dirty data has been moved to: {trash_path}.")
 
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
@@ -389,9 +413,9 @@ def open_pair(input_path, mask_path, img_only):
     raw = tifffile.imread(input_path)
     raw = np.expand_dims(raw, axis=-1)
     image = tf.constant(raw, dtype=tf.float32)
-    raw = tifffile.imread(mask_path)
+    raw = (tifffile.imread(mask_path) > 0).astype(np.uint8)
     raw = np.expand_dims(raw, axis=-1)
-    mask = tf.constant(raw, dtype=tf.float32)
+    mask = tf.constant(raw, dtype=tf.uint8)
     if img_only:
         return image
     else:
@@ -567,9 +591,7 @@ def get_version():
 
 def create_unet2d_model(input_shape):
     """
-    Generates a UNet2D model.
-    The model is created according to the images found in the input folder.
-    The depth of the auto-encoder is defined by the unet_depth parameter.
+    Generates a UNet2D model with ReLU activations after each Conv2D layer.
     """
     inputs = Input(shape=input_shape)
     x = generate_data_augment_layer()(inputs)
@@ -578,21 +600,26 @@ def create_unet2d_model(input_shape):
     skip_connections = []
     for i in range(unet_depth):
         num_filters = num_filters_start * 2**i
-        x = Conv2D(num_filters, 3, padding='same')(x)
-        x = Conv2D(num_filters, 3, padding='same')(x)
+        x = Conv2D(num_filters, 3, padding='same', kernel_initializer='he_normal')(x)
+        x = Activation('relu')(x) 
+        x = Conv2D(num_filters, 3, padding='same', kernel_initializer='he_normal')(x)
+        x = Activation('relu')(x) 
         skip_connections.append(x)
         x = MaxPooling2D(2)(x)
         x = Dropout(dropout_rate)(x)
+
     # Decoder:
     for i in reversed(range(unet_depth)):
         num_filters = num_filters_start * 2**i
         x = UpSampling2D(2)(x)
         x = concatenate([x, skip_connections[i]])
-        x = Conv2D(num_filters, 3, padding='same')(x)
-        x = Conv2D(num_filters, 3, padding='same')(x)
+        x = Conv2D(num_filters, 3, padding='same', kernel_initializer='he_normal')(x)
+        x = Activation('relu')(x) 
+        x = Conv2D(num_filters, 3, padding='same', kernel_initializer='he_normal')(x)
+        x = Activation('relu')(x) 
         x = Dropout(dropout_rate)(x)
 
-    # Output layer
+    # Output layer with sigmoid for binary classification
     outputs = Conv2D(1, 1, activation='sigmoid')(x)
 
     model = Model(inputs=inputs, outputs=outputs)
@@ -665,17 +692,17 @@ def instanciate_model():
     input_shape = get_shape()
     model = create_unet2d_model(input_shape)
     model.compile(
-        optimizer=optimizer, 
-        loss=dice_loss, 
-        metrics=[
-            tf.keras.metrics.FalseNegatives(),
-            tf.keras.metrics.FalsePositives(),
-            tf.keras.metrics.TrueNegatives(),
-            tf.keras.metrics.TruePositives(),
-            tf.keras.metrics.Precision(),
-            tf.keras.metrics.Recall(),
-            tf.keras.metrics.Accuracy()
-        ]
+        optimizer=Adam(learning_rate=learning_rate), 
+        loss= BinaryCrossentropy(), #dice_loss, 
+        # metrics=[
+        #     tf.keras.metrics.FalseNegatives(),
+        #     tf.keras.metrics.FalsePositives(),
+        #     tf.keras.metrics.TrueNegatives(),
+        #     tf.keras.metrics.TruePositives(),
+        #     tf.keras.metrics.Precision(),
+        #     tf.keras.metrics.Recall(),
+        #     tf.keras.metrics.Accuracy()
+        # ]
     )
     return model
 
@@ -705,7 +732,8 @@ def train_model(model, train_dataset, val_dataset):
         train_dataset,
         validation_data=val_dataset,
         epochs=epochs,
-        callbacks=[checkpoint, early_stopping, reduce_lr]
+        callbacks=[checkpoint, early_stopping, reduce_lr],
+        verbose=1
     )
 
     model.save(os.path.join(output_path, 'last.keras'))
@@ -713,16 +741,28 @@ def train_model(model, train_dataset, val_dataset):
 
 
 def main():
+    from pprint import pprint
+
     # 1. Running the sanity checks
-    data_sanity = sanity_check(data_folder)
+    data_sanity, results = sanity_check(data_folder)
     qc_sanity = True
+    results_qc = None
     if qc_folder is not None:
-        qc_sanity = sanity_check(qc_folder)
-    if not data_sanity or not qc_sanity:
-        print(f"ABORT. 😱 Your {'data' if not data_sanity else 'QC data'} is not consistent. Use the content of the sanity check table above to fix all that and try again.")
-        return
+        qc_sanity, results_qc = sanity_check(qc_folder)
+    
+    if not data_sanity:
+        if remove_wrong_data:
+            remove_dirty_data(data_folder, [inputs_name, masks_name], results)
+        else:
+            print(f"ABORT. 😱 Your {'data' if not data_sanity else 'QC data'} is not consistent. Use the content of the sanity check table above to fix all that and try again.")
+            return
     else:
-        print("👍 Your data looks alright!")
+        print("👍 Your training data looks alright!")
+
+    if qc_folder is not None and not qc_sanity:
+        print("🚨 Your QC data is not consistent. Use the content of the sanity check table above to fix all that and try again.")
+    else:
+        print("👍 Your QC data looks alright!")
     
     # 2. Migrate the data locally
     create_local_dirs(reset_local_data)
@@ -746,7 +786,7 @@ def main():
 
     # 5. Create the datasets
     training_dataset   = make_dataset("training").repeat().batch(batch_size).take(batch_size)
-    validation_dataset = make_dataset("validation").repeat().batch(batch_size).take(batch_size)
+    validation_dataset = make_dataset("validation").repeat().batch(16).take(16)
     print(f"   • Training dataset: {len(list(training_dataset))} ({training_dataset}).")
     print(f"   • Validation dataset: {len(list(validation_dataset))} ({validation_dataset}).")
     
