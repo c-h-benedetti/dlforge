@@ -6,6 +6,9 @@ import numpy as np
 import shutil
 import tifffile
 import re
+import math
+
+from yolov5 import train
 
 """
 
@@ -16,6 +19,7 @@ Before starting using this script, please make sure that:
     - You have some annotated images.
     - You have the required modules installed.
     - You cloned/downloaded the YOLOv5 repository (https://github.com/ultralytics/yolov5.git).
+    - You created an empty file named "__init__.py" in the yolov5 folder.
 
 """
 
@@ -65,9 +69,9 @@ remove_wrong_data = True
 
 yolov5_path           = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yolov5")
 validation_percentage = 0.15
-batch_size            = 120
+batch_size            = 16
 epochs                = 50
-classes_names         = ['Microglia']
+classes_names         = ["Rod", "Dividing", "Microcolony"]
 optimizer             = 'Adam'
 learning_rate         = 0.0001
 
@@ -75,6 +79,7 @@ learning_rate         = 0.0001
 
 _IMAGES_REGEX = re.compile(r"(.+)\.(png|jpg)$")
 _ANNOTATIONS_REGEX = re.compile(r"(.+)\.(txt)$")
+_N_CLASSES = len(classes_names)
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 #                            SANITY CHECK                                         #
@@ -84,10 +89,10 @@ _ANNOTATIONS_REGEX = re.compile(r"(.+)\.(txt)$")
 
 """
 List of all the points checked during the sanity check:
-    - [X] Is the content of folders valid?
+    - [X] Is the content of folders valid (only files with the correct extension)?
     - [X] Does every image have its corresponding annotation?
-    - [X] Is each annotation correctly formatted?
-    - [ ] Does every annotation have at least one bounding box?
+    - [X] Is each annotation correctly formatted (class, x, y, width, height)?
+    - [X] Does every annotation have at least one bounding box?
 """
 
 #@markdown ## 📍 a. Sanity check functions
@@ -192,6 +197,54 @@ def sanity_check(source_folder):
 
 _LOCAL_FOLDERS = ["training", "validation", "testing"]
 
+def t_xor(t1, t2):
+    return tuple([i1 if i2 is None else i2 for (i1, i2) in zip(t1, t2)])
+
+def make_tuple(arg, pos, size):
+    return tuple([arg if i == pos else None for i in range(size)])
+
+def files_as_keys(root_folder, sources):
+    """
+    To handle the fact that we have different extensions for the same pair, we use this function producing a dictionary.
+    Keys are the files without their extensions, values are tuples containing the files with their extensions.
+    Example: 'file': ('file.png', 'file.txt').
+
+    Args:
+        root_folder (str): The root folder, containing the `inputs_name` and `annotations_name` folders.
+        sources (folder, regex): Tuples containing sub-folder name and its associated regex pattern.
+    """
+    if len(sources) == 0:
+        raise ValueError("No sources provided.")
+    # Removing extensions to build keys.
+    matches = {}
+    for i, (subfolder, regex) in enumerate(sources):
+        for f in os.listdir(os.path.join(root_folder, subfolder)):
+            groups = regex.match(f)
+            if groups is  None:
+                continue
+            handles = make_tuple(f, i, len(sources))
+            key = groups[1]
+            if key not in matches:
+                matches[key] = handles
+            else:
+                matches[key] = t_xor(matches[key], handles)
+    return matches
+
+def check_files_keys(matches):
+    """
+    Checks if the keys of the dictionary produced by `files_as_keys` are unique.
+
+    Args:
+        matches (dict): The dictionary produced by `files_as_keys`.
+    """
+    errors = set()
+    for key, values in matches.items():
+        if None in values:
+            errors.add(key)
+    if len(errors) > 0:
+        print(f"Errors found: {errors}")
+    return len(errors) == 0
+
 def create_local_dirs(reset=False):
     """
     This function is useless if you don't run the code on Google Colab, or any other cloud service.
@@ -212,7 +265,7 @@ def create_local_dirs(reset=False):
                 shutil.rmtree(path)
             os.makedirs(path, exist_ok=True)
 
-def copy_to(src_folder, dst_folder, files, data_match):
+def copy_to(src_folder, folders_name, files_name, to_copy, dst_folder, usage):
     """
     Copies a list of files from a source folder to a destination folder.
 
@@ -221,11 +274,11 @@ def copy_to(src_folder, dst_folder, files, data_match):
         dst_folder (str): The destination folder.
         files (list): The list of files to copy.
     """
-    for step in [inputs_name, annotations_name]:
-        for f in files:
-            src_path = os.path.join(src_folder, data_match[step][f])
-            dst_path = os.path.join(dst_folder, data_match[step][f])
-            shutil.copy(src_path, dst_path)
+    for key in to_copy:
+        for i, f in enumerate(folders_name):
+            src_path = os.path.join(src_folder, f, files_name[key][i])
+            dst_path = os.path.join(dst_folder, usage, f, files_name[key][i])
+            shutil.copy2(src_path, dst_path)
 
 def check_sum(targets):
     """
@@ -235,16 +288,23 @@ def check_sum(targets):
     acc = sum([i[1] for i in targets])
     return abs(acc - 1.0) < 1e-6
 
-def keys_to_files(source_folder, regex):
-    all_files = os.listdir(source_folder)
-    matches = {}
-    for f in all_files:
-        groups = regex.match(f)
-        if groups is not None:
-            matches[groups[1]] = f
-    return matches
+"""
+Local structure of the data:
+----------------------------
 
-def migrate_data(targets, source):
+working_directory
+├── test
+│   ├── images
+│   └── labels
+├── train
+│   ├── images
+│   └── labels
+└── valid
+    ├── images
+    └── labels
+"""
+
+def migrate_data(targets, source, tuples):
     """
     Copies the content of the source folder to the working directory.
     The percentage of the data to move is defined in the targets list.
@@ -256,42 +316,154 @@ def migrate_data(targets, source):
     """
     if not check_sum(targets):
         raise ValueError("The sum of the ratios must be equal to 1.")
-    folders = [
-        (inputs_name     , _IMAGES_REGEX), 
-        (annotations_name, _ANNOTATIONS_REGEX)
-    ]
-    all_data = []
-    for f in os.listdir(os.path.join(source, inputs_name)):
-        groups = _IMAGES_REGEX.match(f)
-        if groups is not None:
-            all_data.append(groups[1])
-    random.shuffle(all_data)
-
-    data_match = {} # Allows to find matching files with extensions included.
-    for f, r in folders: 
-        data_match[f] = keys_to_files(os.path.join(source, f), r)
+    folders = [inputs_name, annotations_name]
+    all_data = list(tuples.keys())
+    random.shuffle(all_data) # Avoid taking twice the same data by shuffling.
 
     last = 0
     for target, ratio in targets:
         n = int(len(all_data) * ratio)
         copy_to(
-            os.path.join(source, ), 
-            os.path.join(working_directory, target), 
-            all_data[last:last+n], 
-            data_match
-        )
-        copy_to(
-            source, 
-            os.path.join(working_directory, target), 
-            all_data[last:last+n], 
-            data_match
+            source, # folder with 'images' and 'labels'
+            folders, # ['images', 'labels']
+            tuples, # files in every folder
+            all_data[last:last+n], # keys to copy
+            working_directory, # destination root
+            target # destination sub-folder (training, validation, testing)
         )
         last += n
 
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+#                            PREPARE TRAINING                                     #
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+#@markdown # ⭐ 4. PREPARE TRAINING
+
+#@markdown ## 📍 a. Utils
+
+def create_dataset_yml():
+    with open(os.path.join(working_directory, "data.yml"), 'w') as f:
+        f.write(f"train: {os.path.join(working_directory, 'training', inputs_name)}\n")
+        f.write(f"val: {os.path.join(working_directory, 'validation', inputs_name)}\n")
+        f.write("\n")
+        f.write(f"nc: {_N_CLASSES}\n")
+        f.write(f"names: {str(classes_names)}\n")
+
+def get_version():
+    """
+    Used to auto-increment the version number of the model.
+    Since each model is saved in a separate folder, we need to find the latest version number.
+    Starts at 1 when the destination folder is empty.
+
+    Returns:
+        int: The next version number, that doesn't exist yet in the models folder.
+    """
+    if not os.path.isdir(models_path):
+        os.makedirs(models_path)
+    content = sorted([f for f in os.listdir(models_path) if f.startswith(model_name_prefix) and os.path.isdir(os.path.join(models_path, f))])
+    if len(content) == 0:
+        return 1
+    else:
+        return int(content[-1].split('-')[-1].replace('V', '')) + 1
+
+
+#@markdown ## 📍 b. Data visualization
+
+def get_classes_color():
+    """
+    Produces a list of RGB colors (0-255, not 0-1) for each class.
+    Colors are based on the 'gist_rainbow' colormap.
+    """
+    peaks = np.linspace(0, 0.9999, _N_CLASSES) * 256
+    peaks = peaks.astype(np.uint8)
+    gist_rainbow = plt.colormaps['gist_rainbow']
+    indices = np.linspace(0, 1, 256)
+    colors = gist_rainbow(indices)
+    rgb_colors = (colors[:, :3] * 255).astype(int)
+    return np.array([rgb_colors[i] for i in peaks]).astype(float)
+
+def yolo2bbox(bboxes):
+    """
+    Converts bounding boxes in YOLO format to xmin, ymin, xmax, ymax.
+    This is only useful for visualization purposes.
+    """
+    xmin, ymin = bboxes[0]-bboxes[2]/2, bboxes[1]-bboxes[3]/2
+    xmax, ymax = bboxes[0]+bboxes[2]/2, bboxes[1]+bboxes[3]/2
+    return xmin, ymin, xmax, ymax
+
+def plot_box(image, bboxes, labels, colors):
+    # Need the image height and width to denormalize the bounding box coordinates.
+    if len(image.shape) == 3:
+        h, w, _ = image.shape
+    else:
+        h, w = image.shape
+    for box_num, box in enumerate(bboxes):
+        x1, y1, x2, y2 = yolo2bbox(box)
+        xmin = int(x1*w)
+        ymin = int(y1*h)
+        xmax = int(x2*w)
+        ymax = int(y2*h)
+        class_name = classes_names[int(labels[box_num])]
+
+        cv2.rectangle(
+            image,
+            (xmin, ymin), (xmax, ymax),
+            color=colors[classes_names.index(class_name)],
+            thickness=1
+        )
+    return image
+
+def plot(source_folder, subfolders, files_name, colors, n_items=5):
+    all_files = list(files_name.keys())
+    random.shuffle(all_files)
+    count, i = 0, 0
+    plt.figure()
+
+    while (i < len(all_files)) and (count <= n_items):
+        image_path = os.path.join(source_folder, subfolders[0], files_name[all_files[i]][0])
+        label_path = os.path.join(source_folder, subfolders[1], files_name[all_files[i]][1])
+        # We want to plot items from the training set.
+        # -> We must check that the file has not been moved to the validation set.
+        if (not os.path.isfile(image_path)) or (not os.path.isfile(label_path)):
+            i += 1
+            continue
+        image = cv2.imread(image_path)
+        with open(label_path, 'r') as f:
+            bboxes = [] # List of bounding boxes.
+            labels = [] # List of labels corresponding to the bounding boxes.
+            label_lines = f.readlines()
+            for label_line in label_lines:
+                if len(label_line.strip()) == 0 or label_line.startswith('#'):
+                    continue
+                items = label_line.strip().split(' ')
+                label = int(items[0])
+                x_c   = float(items[1])
+                y_c   = float(items[2])
+                w     = float(items[3])
+                h     = float(items[4])
+                bboxes.append([x_c, y_c, w, h])
+                labels.append(label)
+        result_image = plot_box(image, bboxes, labels, colors)
+        plt.subplot(int(math.sqrt(n_items))+1, int(math.sqrt(n_items))+1, count+1)
+        plt.imshow(result_image[:, :, ::-1])
+        plt.axis('off')
+        i += 1
+        count += 1
+
+    plt.subplots_adjust(wspace=0)
+    plt.tight_layout()
+    plt.show()
+
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 #                              MAIN FUNCTION                                      #
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+
+def tests():
+    import yolov5.train
+    # print(dir(yolov5))
 
 
 def main():
@@ -315,251 +487,65 @@ def main():
         print(f"👍 Your QC data looks alright! (Found {len(os.listdir(os.path.join(qc_folder, inputs_name)))} items).")
 
     # 2. Migrate the data to working directory:
+    files_tuples = files_as_keys(data_folder, [
+        (inputs_name, _IMAGES_REGEX),
+        (annotations_name, _ANNOTATIONS_REGEX)
+    ])
+    if not check_files_keys(files_tuples):
+        return False
     create_local_dirs(reset_local_data)
     migrate_data([
         ("training", 1.0-validation_percentage),
         ("validation", validation_percentage)
-        ], data_folder)
+        ], data_folder, files_tuples)
     if qc_folder is not None:
+        qc_tuples = files_as_keys(qc_folder, [
+            (inputs_name, _IMAGES_REGEX),
+            (annotations_name, _ANNOTATIONS_REGEX)
+        ])
+        if not check_files_keys(qc_tuples):
+            return False
         migrate_data([
             ("testing", 1.0)
-            ], qc_folder)
+            ], qc_folder, qc_tuples)
     print("-----------")
     print(f"Training set: {len(os.listdir(os.path.join(working_directory, 'training', inputs_name)))} items.")
     print(f"Validation set: {len(os.listdir(os.path.join(working_directory, 'validation', inputs_name)))} items.")
     if qc_folder is not None:
         print(f"Testing set: {len(os.listdir(os.path.join(working_directory, 'testing', inputs_name)))} items.")
+    
+    # 3. Prepare for training:
+    create_dataset_yml()
+    colors = get_classes_color()
+    plot(
+        os.path.join(working_directory, "training"), 
+        [inputs_name, annotations_name], 
+        files_tuples,
+        colors
+    )
+    v = get_version()
+    version_name = f"{model_name_prefix}-V{str(v).zfill(3)}"
+    model_path = os.path.join(models_path, version_name)
+    os.makedirs(model_path)
+
+    # 4. Launch the training:
+    train.run(
+        data=os.path.join(working_directory, "data.yml"),
+        epochs=epochs,
+        batch_size=batch_size,
+        project=model_path,
+        device='cpu'
+    )
 
 
 if __name__ == "__main__":
+    # tests()
     main()
 
 
 exit(0)
 
 
-src_training_dir = os.path.join(root_dir, "train")
-src_testing_dir  = os.path.join(root_dir, "test")
-# Safety check
-if (VALIDATION < 0.0) or (VALIDATION > 1.0):
-    raise("Validation percentage must be between 0 and 1.")
-
-# Moves p% of the pairs from src_dir to dst_dir
-def move_chunk_to(dst_dir, src_dir, p, just_copy=True):
-    dst_images_dir = os.path.join(dst_dir, "images")
-    dst_annots_dir = os.path.join(dst_dir, "labels")
-    src_images_dir = os.path.join(src_dir, "images")
-    src_annots_dir = os.path.join(src_dir, "labels")
-    if not os.path.isdir(dst_dir):
-        os.makedirs(dst_dir)
-        os.mkdir(dst_images_dir)
-        os.mkdir(dst_annots_dir)
-    items = sorted(os.listdir(src_images_dir))
-    n_items = len(items)
-    if n_items == 0:
-        raise Exception("Nothing found in source folder.")
-    if n_items != len(os.listdir(src_annots_dir)):
-        raise Exception(f"The number of images is different from the number of annotations. {n_items} vs {len(os.listdir(src_annots_dir))}.")
-    ext = items[0].split('.')[-1]
-    n_trans = int(p * n_items)
-    print(f"{n_trans} of {n_items}")
-    indices = np.random.choice(n_items, n_trans, replace=False)
-    task = shutil.copy2 if just_copy else shutil.move
-    for index in indices:
-        p_from = os.path.join(src_images_dir, items[index])
-        p_dest = os.path.join(dst_images_dir, items[index])
-        task(p_from, p_dest)
-        p_from = os.path.join(src_annots_dir, items[index].replace(ext, 'txt'))
-        p_dest = os.path.join(dst_annots_dir, items[index].replace(ext, 'txt'))
-        task(p_from, p_dest)
-
-
-def create_yml():
-    with open(os.path.join(working_dir, "data.yml"), 'w') as f:
-        f.write(f"train: {working_dir}/train/images\n")
-        f.write(f"val: {working_dir}/valid/images\n")
-        f.write("\n")
-        f.write(f"nc: {len(CLASSES)}\n")
-        f.write(f"names: {str(CLASSES)}")
-
-
-dirs = ['train', 'valid', 'test']
-
-if FLUSH or not os.path.isdir(os.path.join(working_dir, "train")):
-    # Removes all the data from previous attempts:
-    for d in dirs:
-        full_path = os.path.join(working_dir, d)
-        if os.path.isdir(full_path):
-            print(f"Deleting {full_path}")
-            shutil.rmtree(full_path)
-
-    # We transfer the whole testing directory
-    print("> Transfering data...")
-    move_chunk_to(os.path.join(working_dir, "test"), src_testing_dir, 1.0)
-    print("Testing data transfered...")
-    move_chunk_to(os.path.join(working_dir, "train"), src_training_dir, 1.0)
-    print("Training data transfered...")
-    move_chunk_to(os.path.join(working_dir, "valid"), os.path.join(working_dir, "train"), VALIDATION, False)
-    print("Validation data transfered...")
-    create_yml()
-    print("> Data transfer: DONE.")
-
-"""- The **testing** data will be used to test the network's inference after the training phase.
-- The **training** data will be used to train the network.
-- The **validation** data (a fraction of the training data) won't ever be seen by the network and will be used during the training phase to measure how the network is learning.
-
-The dataset is structured in the following manner:
-
-```
-working_dir
-├── test
-│   ├── images
-│   └── labels
-├── train
-│   ├── images
-│   └── labels
-└── valid
-    ├── images
-    └── labels
-
-```
-
-### The Dataset YAML File
-
-The dataset YAML (`data.yaml`) file containing the path to the training and validation images and labels is already provided. This file will also contain the class names from the dataset.
-
-The dataset contains 3 classes: **'Rod', 'Dividing', 'Microcolony'**.
-
-The following block shows the contents of the `data.yaml` file.
-
-```yaml
-train: /content/train/images
-val: /content/valid/images
-
-nc: 3
-names: ['Rod', 'Dividing', 'Microcolony']
-```
-
-### Visualize a Few Ground Truth Images
-
-Before moving forward, let's check out few of the ground truth images.
-
-The current annotations in the text files are in normalized `[x_center, y_center, width, height]` format. Let's write a function that will convert it back to `[x_min, y_min, x_max, y_max]` format.
-"""
-
-num_classes = len(CLASSES)
-peaks = np.linspace(0, 0.9999, num_classes) * 256
-peaks = peaks.astype(np.uint8)
-
-gist_rainbow = plt.colormaps['gist_rainbow']
-indices = np.linspace(0, 1, 256)
-colors = gist_rainbow(indices)
-rgb_colors = (colors[:, :3] * 255).astype(int)
-
-colors = np.array([rgb_colors[i] for i in peaks]).astype(float)
-
-# Function to convert bounding boxes in YOLO format to xmin, ymin, xmax, ymax.
-def yolo2bbox(bboxes):
-    xmin, ymin = bboxes[0]-bboxes[2]/2, bboxes[1]-bboxes[3]/2
-    xmax, ymax = bboxes[0]+bboxes[2]/2, bboxes[1]+bboxes[3]/2
-    return xmin, ymin, xmax, ymax
-
-def plot_box(image, bboxes, labels):
-    # Need the image height and width to denormalize
-    # the bounding box coordinates
-    h, w, _ = image.shape
-    for box_num, box in enumerate(bboxes):
-        x1, y1, x2, y2 = yolo2bbox(box)
-        # denormalize the coordinates
-        xmin = int(x1*w)
-        ymin = int(y1*h)
-        xmax = int(x2*w)
-        ymax = int(y2*h)
-        width = xmax - xmin
-        height = ymax - ymin
-
-        class_name = CLASSES[int(labels[box_num])]
-
-        cv2.rectangle(
-            image,
-            (xmin, ymin), (xmax, ymax),
-            color=colors[CLASSES.index(class_name)],
-            thickness=1
-        )
-    return image
-
-# Function to plot images with the bounding boxes.
-def plot(image_paths, label_paths, num_samples):
-    all_training_images = glob.glob(image_paths)
-    all_training_labels = glob.glob(label_paths)
-    all_training_images.sort()
-    all_training_labels.sort()
-
-    num_images = len(all_training_images)
-
-    plt.figure()
-    for i in range(num_samples):
-        j = random.randint(0,num_images-1)
-        image = cv2.imread(all_training_images[j])
-        with open(all_training_labels[j], 'r') as f:
-            bboxes = []
-            labels = []
-            label_lines = f.readlines()
-            for label_line in label_lines:
-                label = label_line[0]
-                bbox_string = label_line[2:]
-                x_c, y_c, w, h = bbox_string.split(' ')
-                x_c = float(x_c)
-                y_c = float(y_c)
-                w = float(w)
-                h = float(h)
-                bboxes.append([x_c, y_c, w, h])
-                labels.append(label)
-        result_image = plot_box(image, bboxes, labels)
-        plt.subplot(2, 2, i+1)
-        plt.imshow(result_image[:, :, ::-1])
-        plt.axis('off')
-    plt.subplots_adjust(wspace=0)
-    plt.tight_layout()
-    plt.show()
-
-# Visualize a few training images.
-plot(
-    image_paths=os.path.join(working_dir, "train", "images", '*'),
-    label_paths=os.path.join(working_dir, "train", "labels", '*'),
-    num_samples=4,
-)
-
-"""## Helper Functions for Logging
-
-Here, we write the helper functions that we need for logging of the results in the notebook while training the models.
-
-Let's create our custom result directories so that we can easily keep track of them and carry out inference using the proper model.
-"""
-
-def set_res_dir():
-    # Directory to store results
-    res_dir_count = len(glob.glob('runs/train/*'))
-    print(f"Current number of result directories: {res_dir_count}")
-    if TRAIN:
-        RES_DIR = f"results_{res_dir_count+1}"
-        print(RES_DIR)
-    else:
-        RES_DIR = f"results_{res_dir_count}"
-    print(f"RES_DIR produced: {RES_DIR}")
-    return RES_DIR
-
-
-"""## Training using YOLOV5
-
-The next step is to train the neural network model.
-
-### Train a medium-sized (yolov5m) Model
-
-Training all the layers of the medium model.
-"""
-
-monitor_tensorboard()
 
 # RES_DIR = set_res_dir()
 # if TRAIN:
