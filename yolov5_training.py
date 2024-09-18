@@ -1,5 +1,4 @@
 import os
-import matplotlib.pyplot as plt
 import cv2
 import random
 import numpy as np
@@ -9,6 +8,10 @@ import re
 import math
 
 from yolov5 import train
+
+# import matplotlib
+# matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
 
 """
 
@@ -38,7 +41,6 @@ Before starting using this script, please make sure that:
 - `model_name_prefix`: Prefix of the model name. Will be part of the folder name in `models_path`.
 - `reset_local_data` : If True, the locally copied training, validation and testing folders will be re-imported.
 
-- `yolov5_path`          : Path to the localy downloaded YOLOv5 repository.
 - `validation_percentage`: Percentage of the data that will be used for validation. This data will be moved to the validation folder.
 - `batch_size`           : Number of images per batch.
 - `epochs`               : Number of epochs for the training.
@@ -55,19 +57,18 @@ Before starting using this script, please make sure that:
 
 #@markdown ## 📍 a. Data paths
 
-data_folder       = "/home/benedetti/Desktop/eaudissect/deep-bacs/train/"
-qc_folder         = "/home/benedetti/Desktop/eaudissect/deep-bacs/qc_data/"
+data_folder       = "/home/benedetti/Desktop/eaudissect/deep-bacs-tiff/train/"
+qc_folder         = "/home/benedetti/Desktop/eaudissect/deep-bacs-tiff/qc_data/"
 inputs_name       = "images"
 annotations_name  = "labels"
 models_path       = "/home/benedetti/Desktop/eaudissect/yolo_working/models"
 working_directory = "/home/benedetti/Desktop/eaudissect/yolo_local"
 model_name_prefix = "YOLOv5"
 reset_local_data  = True
-remove_wrong_data = True
+# preview_data      = True
 
 #@markdown ## 📍 b. Network architecture
 
-yolov5_path           = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yolov5")
 validation_percentage = 0.15
 batch_size            = 16
 epochs                = 50
@@ -77,7 +78,7 @@ learning_rate         = 0.0001
 
 #@markdown ## 📍 c. Constants
 
-_IMAGES_REGEX = re.compile(r"(.+)\.(png|jpg)$")
+_IMAGES_REGEX = re.compile(r"(.+)\.(tif|tiff)$")
 _ANNOTATIONS_REGEX = re.compile(r"(.+)\.(txt)$")
 _N_CLASSES = len(classes_names)
 
@@ -428,7 +429,7 @@ def plot(source_folder, subfolders, files_name, colors, n_items=5):
         if (not os.path.isfile(image_path)) or (not os.path.isfile(label_path)):
             i += 1
             continue
-        image = cv2.imread(image_path)
+        image = tifffile.imread(image_path)
         with open(label_path, 'r') as f:
             bboxes = [] # List of bounding boxes.
             labels = [] # List of labels corresponding to the bounding boxes.
@@ -446,7 +447,7 @@ def plot(source_folder, subfolders, files_name, colors, n_items=5):
                 labels.append(label)
         result_image = plot_box(image, bboxes, labels, colors)
         plt.subplot(int(math.sqrt(n_items))+1, int(math.sqrt(n_items))+1, count+1)
-        plt.imshow(result_image[:, :, ::-1])
+        plt.imshow(result_image[:, :])
         plt.axis('off')
         i += 1
         count += 1
@@ -462,8 +463,18 @@ def plot(source_folder, subfolders, files_name, colors, n_items=5):
 
 
 def tests():
-    import yolov5.train
-    # print(dir(yolov5))
+    from pprint import pprint
+    files_tuples = files_as_keys(data_folder, [
+        (inputs_name, _IMAGES_REGEX),
+        (annotations_name, _ANNOTATIONS_REGEX)
+    ])
+    colors = get_classes_color()
+    plot(
+        os.path.join(working_directory, "training"), 
+        [inputs_name, annotations_name], 
+        files_tuples,
+        colors
+    )
 
 
 def main():
@@ -525,16 +536,14 @@ def main():
     )
     v = get_version()
     version_name = f"{model_name_prefix}-V{str(v).zfill(3)}"
-    model_path = os.path.join(models_path, version_name)
-    os.makedirs(model_path)
-
+    
     # 4. Launch the training:
     train.run(
         data=os.path.join(working_directory, "data.yml"),
         epochs=epochs,
         batch_size=batch_size,
-        project=model_path,
-        device='cpu'
+        project=models_path,
+        name=version_name
     )
 
 
